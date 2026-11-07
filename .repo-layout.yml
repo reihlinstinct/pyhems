@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "comment": "Repo layout contract, enforced by tools/check_repo_layout.py. JSON syntax: valid YAML too, parses with the Python standard library. required: paths that must exist (trailing slash = directory). root: files at the repository root must match allow and never match deny. directories: every tracked top-level directory must be listed; files under it (any depth) must match one allow pattern (matched against the basename).",
+  "required": [
+    "README.md",
+    "LICENSE",
+    "CONTRIBUTING.md"
+  ],
+  "root": {
+    "allow": [
+      "*.lock",
+      "*.md",
+      "*.toml",
+      "*.yaml",
+      "*.yml",
+      ".gitignore",
+      ".python-version",
+      "LICENSE"
+    ],
+    "deny": [
+      "*.py"
+    ]
+  },
+  "directories": {
+    ".github": {
+      "allow": [
+        "*.yml"
+      ]
+    },
+    "docs": {
+      "allow": [
+        "*.md"
+      ]
+    },
+    "mra": {
+      "allow": [
+        "*.json"
+      ]
+    },
+    "scripts": {
+      "allow": [
+        "*.py",
+        "*.xlsx",
+        "*.yaml"
+      ]
+    },
+    "src": {
+      "allow": [
+        "*.py",
+        "*.typed"
+      ]
+    },
+    "tests": {
+      "allow": [
+        "*.py"
+      ]
+    },
+    "tools": {
+      "allow": [
+        "*.py"
+      ]
+    }
+  }
+}
