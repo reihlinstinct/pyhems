@@ -150,3 +150,11 @@ value = codec.decode(node.properties[0xC0], node.properties)
 
 `encode()` raises `ValueError` for fields at a non-zero `byte_offset` and for
 values outside `minimum`/`maximum`.
+
+### CI coverage reports
+
+CI prints statement coverage for the `pyhems` package and keeps XML/Markdown
+reports as the `coverage-report` artifact. The Markdown report also appears in
+the job summary. These reports do not require a Codecov token. The external
+Codecov upload runs only in the upstream repository, not in forks; an optional
+upload is not the source of truth for whether tests measured coverage.
