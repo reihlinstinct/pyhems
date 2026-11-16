@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 
-def test_coverage_is_printed_and_retained():
+def test_coverage_is_printed_and_retained() -> None:
     workflow = yaml.safe_load(
         (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
     )
