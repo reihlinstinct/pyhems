@@ -1,0 +1,269 @@
+"""Tests for protocol frame handling."""
+
+import pytest
+
+from pyhems import EOJ, EPC, ESV, Frame, FrameDecodeError, Property
+from pyhems.discovery import _extract_discovery_info
+
+
+def test_esv_values() -> None:
+    """Test all ECHONET Lite service values are defined."""
+    assert {member.name: member.value for member in ESV} == {
+        "SETI_SNA": 0x50,
+        "SETC_SNA": 0x51,
+        "GET_SNA": 0x52,
+        "INF_SNA": 0x53,
+        "SETGET_SNA": 0x5E,
+        "SETI": 0x60,
+        "SETC": 0x61,
+        "GET": 0x62,
+        "INF_REQ": 0x63,
+        "SETGET": 0x6E,
+        "SET_RES": 0x71,
+        "GET_RES": 0x72,
+        "INF": 0x73,
+        "INFC": 0x74,
+        "INFC_RES": 0x7A,
+        "SETGET_RES": 0x7E,
+    }
+
+
+def test_epc_values() -> None:
+    """Test all common ECHONET Lite property codes are defined."""
+    assert {member.name: member.value for member in EPC} == {
+        "INSTALLATION_LOCATION": 0x81,
+        "IDENTIFICATION_NUMBER": 0x83,
+        "MANUFACTURER_CODE": 0x8A,
+        "PRODUCT_CODE": 0x8C,
+        "SERIAL_NUMBER": 0x8D,
+        "INF_PROPERTY_MAP": 0x9D,
+        "SET_PROPERTY_MAP": 0x9E,
+        "GET_PROPERTY_MAP": 0x9F,
+        "INSTANCE_LIST": 0xD5,
+        "SELF_NODE_INSTANCE_LIST": 0xD6,
+    }
+
+
+class TestProperty:
+    """Tests for Property class."""
+
+    def test_property_pdc(self) -> None:
+        """Test PDC is computed from EDT length."""
+        prop = Property(epc=0x80, edt=b"\x30")
+        assert prop.pdc == 1
+
+        prop = Property(epc=0x80, edt=b"\x01\x02\x03")
+        assert prop.pdc == 3
+
+        prop = Property(epc=0x80)
+        assert prop.pdc == 0
+
+
+class TestFrame:
+    """Tests for Frame class."""
+
+    def test_encode_decode_roundtrip(self) -> None:
+        """Test encoding and decoding a frame."""
+        frame = Frame(
+            tid=0x1234,
+            seoj=EOJ(0x05FF01),
+            deoj=EOJ(0x0EF001),
+            esv=ESV.GET,
+            properties=[Property(epc=0xD6, edt=b"")],
+        )
+
+        encoded = frame.encode()
+        decoded = Frame.decode(encoded)
+
+        assert decoded.tid == frame.tid
+        assert decoded.seoj == frame.seoj
+        assert decoded.deoj == frame.deoj
+        assert decoded.esv == frame.esv
+        assert isinstance(decoded.esv, ESV)
+        assert len(decoded.properties) == 1
+        assert decoded.properties[0].epc == 0xD6
+
+    def test_decode_with_properties(self) -> None:
+        """Test decoding frame with property data."""
+        # ECHONET Lite frame: Get Response with operation status
+        data = bytes(
+            [
+                0x10,
+                0x81,  # EHD1, EHD2
+                0x00,
+                0x01,  # TID
+                0x01,
+                0x30,
+                0x01,  # SEOJ (air conditioner)
+                0x05,
+                0xFF,
+                0x01,  # DEOJ (controller)
+                0x72,  # ESV (Get_Res)
+                0x01,  # OPC
+                0x80,
+                0x01,
+                0x30,  # EPC, PDC, EDT (operation status: ON)
+            ]
+        )
+
+        frame = Frame.decode(data)
+
+        assert frame.tid == 0x0001
+        assert frame.seoj == EOJ(0x013001)
+        assert frame.deoj == EOJ(0x05FF01)
+        assert frame.esv == ESV.GET_RES
+        assert len(frame.properties) == 1
+        assert frame.properties[0].epc == 0x80
+        assert frame.properties[0].edt == b"\x30"
+
+    def test_decode_too_short(self) -> None:
+        """Test decoding raises on short data."""
+        with pytest.raises(ValueError, match="Frame too short"):
+            Frame.decode(b"\x10\x81\x00\x01")
+
+    def test_decode_invalid_header(self) -> None:
+        """Test decoding raises on invalid header."""
+        data = bytes([0x00, 0x00] + [0] * 10)
+        with pytest.raises(ValueError, match="Invalid ECHONET Lite header"):
+            Frame.decode(data)
+
+    @pytest.mark.parametrize(
+        ("data", "match"),
+        [
+            pytest.param(
+                bytes.fromhex("1081000101300105ff0172") + b"\x01\x80",
+                "Incomplete property header",
+                id="missing_pdc",
+            ),
+            pytest.param(
+                bytes.fromhex("1081000101300105ff0172") + b"\x01\x80\x02\x30",
+                "Incomplete property data",
+                id="truncated_edt",
+            ),
+            pytest.param(
+                bytes.fromhex("1081000101300105ff0172") + b"\x02\x80\x01\x30",
+                "Incomplete property header",
+                id="missing_property",
+            ),
+            pytest.param(
+                bytes.fromhex("1081000101300105ff01ff00"),
+                "Unknown ESV",
+                id="unknown_esv",
+            ),
+        ],
+    )
+    def test_decode_rejects_malformed_frame(self, data: bytes, match: str) -> None:
+        """Test malformed frames raise FrameDecodeError instead of other errors."""
+        with pytest.raises(FrameDecodeError, match=match):
+            Frame.decode(data)
+
+    def test_frame_decode_error_is_value_error(self) -> None:
+        """Test FrameDecodeError stays compatible with ValueError handlers."""
+        assert issubclass(FrameDecodeError, ValueError)
+
+
+class TestExtractDiscoveryInfo:
+    """Tests for _extract_discovery_info function."""
+
+    def test_extract_node_id_and_instances(self) -> None:
+        """Test extracting both node_id and instances."""
+        frame = Frame(
+            tid=0x0001,
+            seoj=EOJ(0x013001),
+            deoj=EOJ(0x05FF01),
+            esv=ESV.GET_RES,
+            properties=[
+                Property(
+                    epc=EPC.IDENTIFICATION_NUMBER,
+                    edt=bytes.fromhex("fe00000601058c53e6fffe513d890ef001"),
+                ),
+                Property(
+                    epc=EPC.SELF_NODE_INSTANCE_LIST,
+                    edt=bytes([0x01, 0x01, 0x30, 0x01]),
+                ),
+            ],
+        )
+
+        node_id, instances = _extract_discovery_info(frame)
+        assert node_id == "fe00000601058c53e6fffe513d890ef001"
+        assert instances == [EOJ(0x013001)]
+
+    def test_extract_multiple_instances(self) -> None:
+        """Test extracting multiple instances."""
+        frame = Frame(
+            tid=0x0001,
+            seoj=EOJ(0x013001),
+            deoj=EOJ(0x05FF01),
+            esv=ESV.GET_RES,
+            properties=[
+                Property(
+                    epc=EPC.IDENTIFICATION_NUMBER,
+                    edt=bytes.fromhex("fe00000601058c53e6fffe513d890ef001"),
+                ),
+                Property(
+                    epc=EPC.INSTANCE_LIST,
+                    edt=bytes([0x02, 0x01, 0x30, 0x01, 0x02, 0x79, 0x01]),
+                ),
+            ],
+        )
+
+        node_id, instances = _extract_discovery_info(frame)
+        assert node_id == "fe00000601058c53e6fffe513d890ef001"
+        assert instances == [EOJ(0x013001), EOJ(0x027901)]
+
+    def test_extract_missing_node_id(self) -> None:
+        """Test extraction when node_id is missing."""
+        frame = Frame(
+            tid=0x0001,
+            seoj=EOJ(0x013001),
+            deoj=EOJ(0x05FF01),
+            esv=ESV.GET_RES,
+            properties=[
+                Property(
+                    epc=EPC.SELF_NODE_INSTANCE_LIST,
+                    edt=bytes([0x01, 0x01, 0x30, 0x01]),
+                ),
+            ],
+        )
+
+        node_id, instances = _extract_discovery_info(frame)
+        assert node_id is None
+        assert instances == [EOJ(0x013001)]
+
+    def test_extract_no_instances(self) -> None:
+        """Test extraction when no instances are present."""
+        frame = Frame(
+            tid=0x0001,
+            seoj=EOJ(0x013001),
+            deoj=EOJ(0x05FF01),
+            esv=ESV.GET_RES,
+            properties=[
+                Property(
+                    epc=EPC.IDENTIFICATION_NUMBER,
+                    edt=bytes.fromhex("fe00000601058c53e6fffe513d890ef001"),
+                ),
+            ],
+        )
+
+        node_id, instances = _extract_discovery_info(frame)
+        assert node_id == "fe00000601058c53e6fffe513d890ef001"
+        assert instances == []
+
+
+def test_extract_discovery_info_deduplicates_instances() -> None:
+    """Instances listed by both 0xD5 and 0xD6 are returned once, in order."""
+    instance_list = bytes([2, 0x01, 0x30, 0x01, 0x02, 0x79, 0x01])
+    frame = Frame(
+        tid=1,
+        seoj=EOJ(0x0EF001),
+        deoj=EOJ(0x05FF01),
+        esv=ESV.INF,
+        properties=[
+            Property(epc=EPC.INSTANCE_LIST, edt=instance_list),
+            Property(epc=EPC.SELF_NODE_INSTANCE_LIST, edt=instance_list),
+        ],
+    )
+
+    _node_id, instances = _extract_discovery_info(frame)
+
+    assert instances == [EOJ(0x013001), EOJ(0x027901)]

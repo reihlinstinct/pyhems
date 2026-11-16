@@ -1,0 +1,1308 @@
+# Custom ECHONET Lite property definitions
+#
+# This file is processed by generate_definitions.py and merged into
+# _definitions_generated.py. It is a build-time source; runtime YAML
+# definitions are not supported.
+#
+# Format:
+#   devices:
+#     <class_code>:               # 2-byte class code as hex (e.g., 0x0135)
+#       short_name: <name>        # Required for a class absent from MRA
+#       name_en: <name>           # Required for a class absent from MRA
+#       name_ja: <name>           # Required for a class absent from MRA
+#       properties:
+#         - mode: define           # Optional; defaults to "define"
+#           epc: <epc_code>       # EPC as hex (e.g., 0xF1)
+#           manufacturer_code: <code>  # Optional 3-byte manufacturer code
+#           byte_offset: <offset> # Optional EDT byte position (0-indexed)
+#           # define requires either format or enum_values, and name_en/name_ja/get.
+#           # Two-value enum keys must be one of the generator's classified
+#           # boolean or non-boolean pairs. Boolean pairs become true/false.
+#           format: <mra_format>
+#           unit: <mra_unit>
+#           minimum: <min>
+#           maximum: <max>
+#           multipleOf: <scale>
+#           enum_values: [...]
+#           name_en: <name>
+#           name_ja: <name>
+#           role: <role>
+#
+# mode: define creates a fully specified property for an EPC that is absent
+# from the device MRA. A definition for a common EPC replaces that common
+# definition for the specified class. mode: patch selectively updates an
+# existing device MRA EPC; unspecified fields, including enum display names,
+# are preserved.
+#
+# A generic define and a manufacturer-specific define may not share an
+# (EPC, byte_offset). Multiple enum defines for one EPC/manufacturer are not
+# supported because Home Assistant's enum entity keys do not include offsets.
+#
+# The generator accepts class group codes 0x00-0x06 and 0x0F only. Custom
+# property EPCs must be in 0x80-0xEF or 0xF0-0xFF. For class groups 0x00-0x06,
+# manufacturer_code is forbidden for EPCs 0x80-0xEF and required for EPCs
+# 0xF0-0xFF. For class group 0x0F, manufacturer_code is always required.
+
+devices:
+  # Air cleaner (空気清浄機)
+  0x0135:
+    properties:
+      - epc: 0xF1
+        manufacturer_code: 0x000005
+        byte_offset: 1
+        enum_values:
+          - edt: 0x00
+            key: "true"
+            name_en: "Bright"
+            name_ja: "明るい"
+          - edt: 0x01
+            key: "false"
+            name_en: "Dark"
+            name_ja: "暗い"
+        get: optional
+        name_en: "Illuminance"
+        name_ja: "照度"
+      - epc: 0xF1
+        manufacturer_code: 0x000005
+        byte_offset: 3
+        format: int8
+        unit: Celsius
+        minimum: -127
+        maximum: 125
+        get: optional
+        name_en: "Temperature"
+        name_ja: "温度"
+      - epc: 0xF1
+        manufacturer_code: 0x000005
+        byte_offset: 4
+        format: uint8
+        unit: "%RH"
+        minimum: 0
+        maximum: 100
+        get: optional
+        name_en: "Humidity"
+        name_ja: "湿度"
+      - epc: 0xF1
+        manufacturer_code: 0x000005
+        byte_offset: 28
+        format: uint8
+        unit: "µg/m³"
+        minimum: 0
+        maximum: 255
+        get: optional
+        name_en: "PM2.5"
+        name_ja: "PM2.5"
+
+  # Ceiling fan (シーリングファン)
+  # A unit without a light omits the light EPCs from its property maps.
+  0x013A:
+    short_name: ceilingFan
+    name_en: Ceiling fan
+    name_ja: シーリングファン
+    properties:
+      - epc: 0xF0
+        manufacturer_code: 0x0000FE
+        enum_values:
+          - edt: 0x31
+            key: level_1
+            name_en: "10%"
+            name_ja: "10%"
+          - edt: 0x32
+            key: level_2
+            name_en: "20%"
+            name_ja: "20%"
+          - edt: 0x33
+            key: level_3
+            name_en: "30%"
+            name_ja: "30%"
+          - edt: 0x34
+            key: level_4
+            name_en: "40%"
+            name_ja: "40%"
+          - edt: 0x35
+            key: level_5
+            name_en: "50%"
+            name_ja: "50%"
+          - edt: 0x36
+            key: level_6
+            name_en: "60%"
+            name_ja: "60%"
+          - edt: 0x37
+            key: level_7
+            name_en: "70%"
+            name_ja: "70%"
+          - edt: 0x38
+            key: level_8
+            name_en: "80%"
+            name_ja: "80%"
+          - edt: 0x39
+            key: level_9
+            name_en: "90%"
+            name_ja: "90%"
+          - edt: 0x3A
+            key: level_10
+            name_en: "100%"
+            name_ja: "100%"
+        get: optional
+        set: optional
+        name_en: Air flow rate setting
+        name_ja: 風量設定
+        description_en: Used to specify the air flow rate by selecting a level from among the predefined levels, and to acquire the current setting. The last setting is kept while power is off.
+        description_ja: 風量レベルを設定し、設定状態を取得する。電源オフ中も直前の風量を保持する。
+        role: primary
+      - epc: 0xF1
+        manufacturer_code: 0x0000FE
+        enum_values:
+          - edt: 0x41
+            key: down
+            name_en: Down
+            name_ja: 下向き
+          - edt: 0x42
+            key: up
+            name_en: Up
+            name_ja: 上向き
+        get: optional
+        set: optional
+        name_en: Air flow direction setting
+        name_ja: 風向
+        description_en: Downward or upward air flow.
+        description_ja: 下向きまたは上向きの風向。
+        role: setting
+      - epc: 0xF2
+        manufacturer_code: 0x0000FE
+        enum_values:
+          - edt: 0x30
+            key: "on"
+            name_en: "On"
+            name_ja: 入
+          - edt: 0x31
+            key: "off"
+            name_en: "Off"
+            name_ja: 切
+        get: optional
+        set: optional
+        name_en: Natural wind
+        name_ja: 自然風
+        description_en: Varies the air flow like outdoor wind.
+        description_ja: 屋外の風のように風量を変化させる。
+        role: setting
+      - epc: 0xF3
+        manufacturer_code: 0x0000FE
+        enum_values:
+          - edt: 0x30
+            key: "on"
+            name_en: "On"
+            name_ja: 入
+          - edt: 0x31
+            key: "off"
+            name_en: "Off"
+            name_ja: 切
+        get: optional
+        set: optional
+        name_en: Light
+        name_ja: 照明
+        description_en: This property indicates whether the light is on.
+        description_ja: 照明の点灯状態を示す。
+        role: primary
+      - epc: 0xF4
+        manufacturer_code: 0x0000FE
+        enum_values:
+          - edt: 0x42
+            key: normal
+            name_en: Main lighting
+            name_ja: 通常灯
+          - edt: 0x43
+            key: night
+            name_en: Night lighting
+            name_ja: 常夜灯
+        get: optional
+        set: optional
+        name_en: Lighting mode setting
+        name_ja: 点灯モード設定
+        description_en: Main lighting or night lighting.
+        description_ja: 通常灯または常夜灯。
+        role: setting
+      - epc: 0xF5
+        manufacturer_code: 0x0000FE
+        format: uint8
+        unit: "%"
+        minimum: 1
+        maximum: 100
+        get: optional
+        set: optional
+        name_en: Light level setting
+        name_ja: 照明の明るさ設定
+        description_en: This property indicates light level in %.
+        description_ja: 照明の明るさを%で示す。
+        role: setting
+      - epc: 0xF6
+        manufacturer_code: 0x0000FE
+        format: uint8
+        minimum: 0
+        maximum: 100
+        get: optional
+        set: optional
+        name_en: Light color setting
+        name_ja: 光色設定
+        description_en: 0 is warm, 100 is cool.
+        description_ja: 0は暖色、100は寒色。
+        role: setting
+      - epc: 0xF7
+        manufacturer_code: 0x0000FE
+        enum_values:
+          - edt: 0x01
+            key: low
+            name_en: Low
+            name_ja: 低
+          - edt: 0x32
+            key: medium
+            name_en: Medium
+            name_ja: 中
+          - edt: 0x64
+            key: high
+            name_en: High
+            name_ja: 高
+        get: optional
+        set: optional
+        name_en: Night lighting level
+        name_ja: 常夜灯レベル
+        description_en: This property indicates the night lighting level.
+        description_ja: 常夜灯のレベルを示す。
+        role: setting
+      - epc: 0xFC
+        manufacturer_code: 0x0000FE
+        enum_values:
+          - edt: 0x30
+            key: "on"
+            name_en: Beep
+            name_ja: 鳴動
+          - edt: 0x31
+            key: "off"
+            name_en: Silent
+            name_ja: 無音
+        get: optional
+        set: optional
+        name_en: Buzzer
+        name_ja: ブザー
+        description_en: Used to sound the confirmation beep for this command.
+        description_ja: この操作の確認音を鳴らす。
+        role: setting
+      - epc: 0xFD
+        manufacturer_code: 0x0000FE
+        enum_values:
+          - edt: 0x01
+            key: remoteController
+            name_en: Remote Controller
+            name_ja: リモコン
+          - edt: 0x03
+            key: wifi
+            name_en: Wi-Fi
+            name_ja: Wi-Fi
+        get: optional
+        set: optional
+        name_en: Control source
+        name_ja: 制御元
+        description_en: This property indicates the source of the control command.
+        description_ja: 操作元を示す。
+        role: setting
+
+  # Housing solar power generation (住宅用太陽光発電)
+  0x0279:
+    properties:
+      - epc: 0xF2
+        manufacturer_code: 0x000005
+        byte_offset: 0
+        format: uint16
+        unit: "V"
+        minimum: 0
+        maximum: 65533
+        get: optional
+        name_en: "Input Voltage 1"
+        name_ja: "入力電圧1"
+        role: status
+      - epc: 0xF2
+        manufacturer_code: 0x000005
+        byte_offset: 2
+        format: uint16
+        unit: "V"
+        minimum: 0
+        maximum: 65533
+        get: optional
+        name_en: "Input Voltage 2"
+        name_ja: "入力電圧2"
+        role: status
+      - epc: 0xF2
+        manufacturer_code: 0x000005
+        byte_offset: 4
+        format: uint16
+        unit: "V"
+        minimum: 0
+        maximum: 65533
+        get: optional
+        name_en: "Input Voltage 3"
+        name_ja: "入力電圧3"
+        role: status
+      - epc: 0xF2
+        manufacturer_code: 0x000005
+        byte_offset: 6
+        format: uint16
+        unit: "V"
+        minimum: 0
+        maximum: 65533
+        get: optional
+        name_en: "Input Voltage 4"
+        name_ja: "入力電圧4"
+        role: status
+      - epc: 0xF3
+        manufacturer_code: 0x000005
+        byte_offset: 0
+        format: uint8
+        unit: "A"
+        minimum: 0
+        maximum: 253
+        multipleOf: 0.1
+        get: optional
+        name_en: "Input Current 1"
+        name_ja: "入力電流1"
+        role: status
+      - epc: 0xF3
+        manufacturer_code: 0x000005
+        byte_offset: 1
+        format: uint8
+        unit: "A"
+        minimum: 0
+        maximum: 253
+        multipleOf: 0.1
+        get: optional
+        name_en: "Input Current 2"
+        name_ja: "入力電流2"
+        role: status
+      - epc: 0xF3
+        manufacturer_code: 0x000005
+        byte_offset: 2
+        format: uint8
+        unit: "A"
+        minimum: 0
+        maximum: 253
+        multipleOf: 0.1
+        get: optional
+        name_en: "Input Current 3"
+        name_ja: "入力電流3"
+        role: status
+      - epc: 0xF3
+        manufacturer_code: 0x000005
+        byte_offset: 3
+        format: uint8
+        unit: "A"
+        minimum: 0
+        maximum: 253
+        multipleOf: 0.1
+        get: optional
+        name_en: "Input Current 4"
+        name_ja: "入力電流4"
+        role: status
+      - epc: 0xF4
+        manufacturer_code: 0x000005
+        byte_offset: 0
+        format: uint16
+        unit: "W"
+        minimum: 0
+        maximum: 65533
+        multipleOf: 10
+        get: optional
+        name_en: "Input Power 1"
+        name_ja: "入力電力1"
+        role: status
+      - epc: 0xF4
+        manufacturer_code: 0x000005
+        byte_offset: 2
+        format: uint16
+        unit: "W"
+        minimum: 0
+        maximum: 65533
+        multipleOf: 10
+        get: optional
+        name_en: "Input Power 2"
+        name_ja: "入力電力2"
+        role: status
+      - epc: 0xF4
+        manufacturer_code: 0x000005
+        byte_offset: 4
+        format: uint16
+        unit: "W"
+        minimum: 0
+        maximum: 65533
+        multipleOf: 10
+        get: optional
+        name_en: "Input Power 3"
+        name_ja: "入力電力3"
+        role: status
+      - epc: 0xF4
+        manufacturer_code: 0x000005
+        byte_offset: 6
+        format: uint16
+        unit: "W"
+        minimum: 0
+        maximum: 65533
+        multipleOf: 10
+        get: optional
+        name_en: "Input Power 4"
+        name_ja: "入力電力4"
+        role: status
+
+    # Multiple input PCS (マルチ入力PCS) - Nichicon manufacturer-specific properties
+  0x02A5:
+    properties:
+      - epc: 0xF5
+        manufacturer_code: 0x00006C
+        byte_offset: 0
+        format: int32
+        unit: "W"
+        minimum: -999999999
+        maximum: 999999999
+        get: optional
+        name_en: "Measured instantaneous grid electric power"
+        name_ja: "系統瞬時電力計測値"
+        description_en: >-
+          Instantaneous power exchanged with the grid. Negative while
+          purchasing from the grid, positive while selling to it.
+        description_ja: >-
+          系統との瞬時電力。買電時は負値、売電時は正値。
+        role: instantaneous
+      - epc: 0xF5
+        manufacturer_code: 0x00006C
+        byte_offset: 4
+        format: int32
+        unit: "W"
+        minimum: -999999999
+        maximum: 999999999
+        get: optional
+        name_en: "Measured instantaneous house consumption"
+        name_ja: "宅内消費瞬時電力計測値"
+        description_en: >-
+          Instantaneous electric power consumed by the household.
+        description_ja: >-
+          宅内で消費されている瞬時電力。
+        role: instantaneous
+      - epc: 0xF6
+        manufacturer_code: 0x00006C
+        byte_offset: 0
+        format: uint32
+        unit: "kWh"
+        minimum: 0
+        maximum: 4294967293
+        multipleOf: 0.001
+        get: optional
+        name_en: "Cumulative Electric Energy Bought"
+        name_ja: "積算買電電力量"
+      - epc: 0xF6
+        manufacturer_code: 0x00006C
+        byte_offset: 4
+        format: uint32
+        unit: "kWh"
+        minimum: 0
+        maximum: 4294967293
+        multipleOf: 0.001
+        get: optional
+        name_en: "Cumulative Electric Energy Sold"
+        name_ja: "積算売電電力量"
+
+    # Controller (コントローラ) - Sharp manufacturer-specific properties
+  0x05FF:
+    properties:
+      - epc: 0xF2
+        manufacturer_code: 0x000005
+        format: uint32
+        unit: "W"
+        minimum: 0
+        maximum: 4294967293
+        multipleOf: 0.1
+        get: optional
+        name_en: "Instantaneous Electric Power Sold"
+        name_ja: "瞬時売電電力"
+        role: instantaneous
+      - epc: 0xF3
+        manufacturer_code: 0x000005
+        format: uint32
+        unit: "W"
+        minimum: 0
+        maximum: 4294967293
+        multipleOf: 0.1
+        get: optional
+        name_en: "Instantaneous Electric Power Bought"
+        name_ja: "瞬時買電電力"
+        role: instantaneous
+      - epc: 0xF4
+        manufacturer_code: 0x000005
+        format: uint32
+        unit: "Wh"
+        minimum: 0
+        maximum: 4294967293
+        get: optional
+        name_en: "Cumulative Electric Energy Sold"
+        name_ja: "積算売電電力量"
+      - epc: 0xF5
+        manufacturer_code: 0x000005
+        format: uint32
+        unit: "Wh"
+        minimum: 0
+        maximum: 4294967293
+        get: optional
+        name_en: "Cumulative Electric Energy Bought"
+        name_ja: "積算買電電力量"
+
+    # Home air conditioner (家庭用エアコン)
+    # Air flow direction (vertical) setting (風向上下設定) EPC 0xA4
+    # 5 angles from horizontal(→) to downward(↓), expressed as arrow combinations
+    # Air flow direction (horizontal) setting (風向左右設定) EPC 0xA5
+    # Display with arrow symbols instead of verbose text descriptions
+    # 5 fixed positions: L(←) LC(↙) C(↓) RC(↘) R(→)
+    # Absent positions are replaced with fullwidth space (U+3000) to align columns
+  0x0130:
+    properties:
+      - mode: patch
+        epc: 0xA4
+        enum_values:
+          - key: uppermost
+            name_en: "|　　→|"
+            name_ja: "|　　→|"
+          - key: upperCenter
+            name_en: "|　↘→|"
+            name_ja: "|　↘→|"
+          - key: central
+            name_en: "|　↘　|"
+            name_ja: "|　↘　|"
+          - key: lowerCenter
+            name_en: "|↓↘　|"
+            name_ja: "|↓↘　|"
+          - key: lowermost
+            name_en: "|↓　　|"
+            name_ja: "|↓　　|"
+      - mode: patch
+        epc: 0xA5
+        enum_values:
+          - key: r
+            name_en: "|　　　　→|"
+            name_ja: "|　　　　→|"
+          - key: rc
+            name_en: "|　　　↘　|"
+            name_ja: "|　　　↘　|"
+          - key: c
+            name_en: "|　　↓　　|"
+            name_ja: "|　　↓　　|"
+          - key: lc
+            name_en: "|　↙　　　|"
+            name_ja: "|　↙　　　|"
+          - key: l
+            name_en: "|←　　　　|"
+            name_ja: "|←　　　　|"
+          - key: rc_r
+            name_en: "|　　　↘→|"
+            name_ja: "|　　　↘→|"
+          - key: c_r
+            name_en: "|　　↓　→|"
+            name_ja: "|　　↓　→|"
+          - key: lc_r
+            name_en: "|　↙　　→|"
+            name_ja: "|　↙　　→|"
+          - key: l_r
+            name_en: "|←　　　→|"
+            name_ja: "|←　　　→|"
+          - key: c_rc
+            name_en: "|　　↓↘　|"
+            name_ja: "|　　↓↘　|"
+          - key: lc_rc
+            name_en: "|　↙　↘　|"
+            name_ja: "|　↙　↘　|"
+          - key: l_rc
+            name_en: "|←　　↘　|"
+            name_ja: "|←　　↘　|"
+          - key: lc_c
+            name_en: "|　↙↓　　|"
+            name_ja: "|　↙↓　　|"
+          - key: l_c
+            name_en: "|←　↓　　|"
+            name_ja: "|←　↓　　|"
+          - key: l_lc
+            name_en: "|←↙　　　|"
+            name_ja: "|←↙　　　|"
+          - key: c_rc_r
+            name_en: "|　　↓↘→|"
+            name_ja: "|　　↓↘→|"
+          - key: lc_rc_r
+            name_en: "|　↙　↘→|"
+            name_ja: "|　↙　↘→|"
+          - key: lc_c_r
+            name_en: "|　↙↓　→|"
+            name_ja: "|　↙↓　→|"
+          - key: lc_c_rc
+            name_en: "|　↙↓↘　|"
+            name_ja: "|　↙↓↘　|"
+          - key: l_rc_r
+            name_en: "|←　　↘→|"
+            name_ja: "|←　　↘→|"
+          - key: l_c_r
+            name_en: "|←　↓　→|"
+            name_ja: "|←　↓　→|"
+          - key: l_c_rc
+            name_en: "|←　↓↘　|"
+            name_ja: "|←　↓↘　|"
+          - key: l_lc_r
+            name_en: "|←↙　　→|"
+            name_ja: "|←↙　　→|"
+          - key: l_lc_rc
+            name_en: "|←↙　↘　|"
+            name_ja: "|←↙　↘　|"
+          - key: l_lc_c
+            name_en: "|←↙↓　　|"
+            name_ja: "|←↙↓　　|"
+          - key: lc_c_rc_r
+            name_en: "|　↙↓↘→|"
+            name_ja: "|　↙↓↘→|"
+          - key: l_c_rc_r
+            name_en: "|←　↓↘→|"
+            name_ja: "|←　↓↘→|"
+          - key: l_lc_rc_r
+            name_en: "|←↙　↘→|"
+            name_ja: "|←↙　↘→|"
+          - key: l_lc_c_r
+            name_en: "|←↙↓　→|"
+            name_ja: "|←↙↓　→|"
+          - key: l_lc_c_rc
+            name_en: "|←↙↓↘　|"
+            name_ja: "|←↙↓↘　|"
+          - key: l_lc_c_rc_r
+            name_en: "|←↙↓↘→|"
+            name_ja: "|←↙↓↘→|"
+
+    # Air conditioner ventilation fan (空調換気扇)
+    # Heat exchanger operation setting (熱交換機動作設定) EPC 0xE0
+    # MRA bug: "false" (OFF) is incorrectly labeled "Heat exchanger ON"
+  0x0134:
+    properties:
+      - mode: patch
+        epc: 0xE0
+        enum_values:
+          - key: "false"
+            name_en: "Heat exchanger OFF"
+
+  0x03B8:
+    short_name: combinationMicrowaveOven
+    name_en: combination microwave oven (electronic oven)
+    name_ja: オーブンレンジ
+    properties:
+      - epc: 0xB0
+        name_en: Door open/close status
+        name_ja: ドア開閉状態
+        get: optional
+        set: notApplicable
+        enum_values:
+          - edt: 0x41
+            key: open
+            name_en: Door open
+            name_ja: ドア開
+          - edt: 0x42
+            key: close
+            name_en: door closed
+            name_ja: ドア閉
+      - epc: 0xB1
+        name_en: Heating status
+        name_ja: 加熱状態
+        get: optional
+        set: notApplicable
+        enum_values:
+          - edt: 0x40
+            key: initialstate
+            name_en: Initial state
+            name_ja: 初期状態
+          - edt: 0x41
+            key: heating
+            name_en: Heating
+            name_ja: 運転中
+          - edt: 0x42
+            key: heatingSuspended
+            name_en: Heating suspended
+            name_ja: 一時停止中
+          - edt: 0x43
+            key: reportingCompletionOfHeatingCycle
+            name_en: Reporting completion of heating cycle
+            name_ja: 完了報知中
+          - edt: 0x44
+            key: setting
+            name_en: Setting
+            name_ja: 設定中
+          - edt: 0x45
+            key: preheating
+            name_en: Preheating
+            name_ja: 予熱中
+          - edt: 0x46
+            key: preheatTemperatureMaintenance
+            name_en: Preheat temperature maintenance
+            name_ja: 予熱完了保温中
+          - edt: 0x47
+            key: heatingTemporarilyStoppedForManualCookingAction
+            name_en: Heating temporarily stopped for manual cooking action
+            name_ja: 加熱途中報知一時停止中
+      - epc: 0xB2
+        name_en: Heating setting
+        name_ja: 加熱設定
+        get: optional
+        set: optional
+        enum_values:
+          - edt: 0x41
+            key: startRestartHeatingHeatingStartedRestarted
+            name_en: Start/restart heating (heating started/restarted)
+            name_ja: 加熱開始・再開
+          - edt: 0x42
+            key: suspendHeatingHeatingSuspended
+            name_en: Suspend heating (heating suspended)
+            name_ja: 加熱一時停止
+          - edt: 0x43
+            key: stopHeatingHeatingStopped
+            name_en: Stop heating (heating stopped)
+            name_ja: 加熱停止
+      - epc: 0xE0
+        name_en: Heating mode setting
+        name_ja: 加熱モード設定
+        get: optional
+        set: optional
+        enum_values:
+          - edt: 0x41
+            key: microwaveHeating
+            name_en: Microwave heating
+            name_ja: 電子レンジ加熱
+          - edt: 0x42
+            key: defrosting
+            name_en: Defrosting
+            name_ja: 解凍
+          - edt: 0x43
+            key: oven
+            name_en: Oven
+            name_ja: オーブン
+          - edt: 0x44
+            key: grill
+            name_en: Grill
+            name_ja: グリル
+          - edt: 0x45
+            key: toaster
+            name_en: Toaster
+            name_ja: トースト
+          - edt: 0x46
+            key: fermenting
+            name_en: Fermenting
+            name_ja: 発酵
+          - edt: 0x47
+            key: stewing
+            name_en: Stewing
+            name_ja: 煮込み
+          - edt: 0x48
+            key: steaming
+            name_en: Steaming
+            name_ja: スチーム加熱
+          - edt: 0x51
+            key: twoStageMicrowaveHeating
+            name_en: Two-stage microwave heating
+            name_ja: 電子レンジ２段加熱
+          - edt: 0xFF
+            key: noModeSpecified
+            name_en: No mode specified
+            name_ja: 未設定
+      - epc: 0xE1
+        name_en: Automatic heating setting
+        name_ja: 自動加熱設定
+        get: optional
+        set: optional
+        enum_values:
+          - edt: 0x41
+            key: automatic
+            name_en: Automatic
+            name_ja: 自動
+          - edt: 0x42
+            key: manual
+            name_en: Manual
+            name_ja: マニュアル
+          - edt: 0xFF
+            key: notSpecified
+            name_en: Not specified
+            name_ja: 未設定
+      - epc: 0xE2
+        name_en: Automatic heating level setting
+        name_ja: 自動加熱レベル設定
+        get: optional
+        set: optional
+        enum_values:
+          - edt: 0x31
+            key: level1
+            name_en: Level 1
+            name_ja: Level 1
+          - edt: 0x32
+            key: level2
+            name_en: Level 2
+            name_ja: Level 2
+          - edt: 0x33
+            key: level3
+            name_en: Level 3
+            name_ja: Level 3
+          - edt: 0x34
+            key: level4
+            name_en: Level 4
+            name_ja: Level 4
+          - edt: 0x35
+            key: level5
+            name_en: Level 5
+            name_ja: Level 5
+          - edt: 0xFF
+            key: notSpecified
+            name_en: Not specified
+            name_ja: 未設定
+      - epc: 0xD0
+        name_en: Automatic heating menu setting
+        name_ja: 自動メニューコース設定
+        get: optional
+        set: optional
+        enum_values:
+          - edt: 0x00
+            key: fullyAutomatic
+            name_en: Fully automatic
+            name_ja: 全自動
+          - edt: 0x01
+            key: reheatingBoiledRice
+            name_en: Reheating boiled rice
+            name_ja: ごはんあたため
+          - edt: 0x02
+            key: reheatingCookedDish
+            name_en: Reheating cooked dish
+            name_ja: おかずあたため
+          - edt: 0x03
+            key: sake
+            name_en: Sake
+            name_ja: お酒
+          - edt: 0x04
+            key: milk
+            name_en: Milk
+            name_ja: 牛乳
+          - edt: 0x05
+            key: boilingLeafyVegetables
+            name_en: Boiling leafy vegetables
+            name_ja: ゆで葉菜
+          - edt: 0x06
+            key: boilingFruitFlowerVegetables
+            name_en: Boiling fruit/flower vegetables
+            name_ja: ゆで果花菜
+          - edt: 0x07
+            key: boilingRootVegetables
+            name_en: Boiling root vegetables
+            name_ja: ゆで根菜
+          - edt: 0x20
+            key: defrostingMeat
+            name_en: Defrosting meat
+            name_ja: 肉解凍
+          - edt: 0x21
+            key: defrostingSashimi
+            name_en: Defrosting sashimi
+            name_ja: さしみ解凍
+          - edt: 0x30
+            key: hamburgerSteaks
+            name_en: Hamburger steaks
+            name_ja: ハンバーグ
+          - edt: 0x31
+            key: gratins
+            name_en: Gratins
+            name_ja: グラタン
+          - edt: 0x32
+            key: chawanMushi
+            name_en: Chawan-mushi
+            name_ja: 茶碗蒸
+          - edt: 0x33
+            key: cookingRice
+            name_en: Cooking rice
+            name_ja: 炊飯
+          - edt: 0x34
+            key: reheatingFries
+            name_en: Reheating fries
+            name_ja: 揚げ物再加熱
+          - edt: 0x35
+            key: fries
+            name_en: Fries
+            name_ja: フライ
+          - edt: 0x60
+            key: spongeCakes
+            name_en: Sponge cakes
+            name_ja: スポンジケーキ
+          - edt: 0x61
+            key: chiffonCakes
+            name_en: Chiffon cakes
+            name_ja: シフォンケーキ
+          - edt: 0x62
+            key: cookies
+            name_en: Cookies
+            name_ja: クッキー
+          - edt: 0x63
+            key: creamPuffs
+            name_en: Cream puffs
+            name_ja: シュー皮
+          - edt: 0x64
+            key: rolls
+            name_en: Rolls
+            name_ja: ロールパン
+          - edt: 0x65
+            key: toast
+            name_en: Toast
+            name_ja: 食パン
+          - edt: 0xFF
+            key: noAutomaticHeatingCycleSpecified
+            name_en: No automatic heating cycle specified
+            name_ja: 未設定
+      - epc: 0xD1
+        name_en: Oven mode setting
+        name_ja: オーブンモード設定
+        get: optional
+        set: optional
+        enum_values:
+          - edt: 0x40
+            key: automaticSelectionMode
+            name_en: Automatic selection mode
+            name_ja: 自動選択モード
+          - edt: 0x41
+            key: convectionOvenMode
+            name_en: Convection oven mode
+            name_ja: 対流オーブンモード
+          - edt: 0x42
+            key: circulationOvenMode
+            name_en: Circulation oven mode
+            name_ja: 熱風オーブンモード
+          - edt: 0x43
+            key: hybridOvenMode
+            name_en: Hybrid oven mode
+            name_ja: 複合オーブンモード
+          - edt: 0xFF
+            key: noSubModeSpecified
+            name_en: No sub-mode specified
+            name_ja: 未設定
+      - epc: 0xD5
+        name_en: Oven preheating setting
+        name_ja: オーブン予熱設定
+        get: optional
+        set: optional
+        enum_values:
+          - edt: 0x41
+            key: withPreheating
+            name_en: With preheating
+            name_ja: 予熱あり
+          - edt: 0x42
+            key: withoutPreheating
+            name_en: Without preheating
+            name_ja: 予熱なし
+          - edt: 0xFF
+            key: notSpecified
+            name_en: Not specified
+            name_ja: 未設定
+      - epc: 0xD6
+        name_en: Fermenting mode setting
+        name_ja: 発酵モード設定
+        get: optional
+        set: optional
+        enum_values:
+          - edt: 0x40
+            key: automaticSelectionMode
+            name_en: Automatic selection mode
+            name_ja: 自動選択モード
+          - edt: 0x41
+            key: convectionFermentationMode
+            name_en: Convection fermentation mode
+            name_ja: 対流発酵モード
+          - edt: 0x42
+            key: circulationFermentationMode
+            name_en: Circulation fermentation mode
+            name_ja: 熱風発酵モード
+          - edt: 0x43
+            key: hybridFermentationMode
+            name_en: Hybrid fermentation mode
+            name_ja: 複合発酵モード
+          - edt: 0x51
+            key: microwaveFermentationMode
+            name_en: Microwave fermentation mode
+            name_ja: 電子レンジ発酵モード
+          - edt: 0xFF
+            key: noModeSpecified
+            name_en: No mode specified
+            name_ja: 未設定
+      #- epc: 0xE3
+      #  name_en: Chamber temperature setting
+      #  name_ja: 庫内温度設定値
+      #  get: optional
+      #  set: optional
+      #  format: int16
+      #  unit: Celsius
+      #  minimum: -2732
+      #  maximum: 32766
+      #  multipleOf: 0.1
+      - epc: 0xE4
+        name_en: Food temperature setting
+        name_ja: 仕上がり温度設定値
+        get: optional
+        set: optional
+        format: int16
+        unit: Celsius
+        minimum: -2732
+        maximum: 32766
+        multipleOf: 0.1
+      # - epc: 0xE5
+      #   name_en: Heating time setting
+      #   name_ja: 加熱時間設定値
+      # - epc: 0xE6
+      #   name_en: Remaining heating time setting
+      #   name_ja: 加熱残時間設定値
+      - epc: 0xE7
+        name_en: Microwave heating power setting
+        name_ja: 電子レンジ加熱出力設定値
+        get: optional
+        set: optional
+        format: uint16
+        unit: W
+        minimum: 0
+        maximum: 65533
+      # - epc: 0xE8
+      #   name_en: Prompt message setting
+      #   name_ja: 途中報知パターン設定
+      # - epc: 0xE9
+      #   name_en: Accessories to combination microwave oven setting
+      #   name_ja: 付属品設定
+      # - epc: 0xEA
+      #   name_en: Display character string setting
+      #   name_ja: 表示文字列設定
+      # - epc: 0xEB
+      #   name_en: Two-stage microwave heating setting (duration)
+      #   name_ja: 電子レンジ 2 段加熱時間設定値
+      # - epc: 0xEC
+      #   name_en: Two-stage microwave heating setting (heating power)
+      #   name_ja: 電子レンジ 2 段加熱出力設定値
+
+    # User-defined objects in the 0x0Fxx class range (0x0Fxxユーザ定義オブジェクト)
+  0x0F01:
+    short_name: userDefinedDevice
+    name_en: User-defined device (0x0F01)
+    name_ja: ユーザ定義デバイス (0x0F01)
+    properties:
+      # 三菱エアリゾート本体
+      - epc: 0xB0
+        manufacturer_code: 0x000006
+        name_en: Operation mode setting
+        name_ja: 運転モード設定
+        get: required
+        set: required
+        description_en: Used to specify the operation mode ('automatic','cooling','heating','dehumidification','air circulator' or 'other'), and to acquire the current setting.
+        description_ja: 自動/冷房/暖房/除湿/送風/その他の運転モードを設定し、設定状態を取得する
+        enum_values:
+          - edt: 0x42
+            key: cooling
+            name_en: Cooling
+            name_ja: 冷房
+          - edt: 0x43
+            key: heating
+            name_en: Heating
+            name_ja: 暖房
+          - edt: 0x44
+            key: dehumidification
+            name_en: Dehumidify (High)
+            name_ja: 除湿強
+          - edt: 0x45
+            key: dehumidification_low
+            name_en: Dehumidify (Low)
+            name_ja: 除湿弱
+          - edt: 0x40
+            key: circulation
+            name_en: Air circulation
+            name_ja: 送風
+      - epc: 0xBE
+        manufacturer_code: 0x000006
+        name_en: Measured outdoor air temperature
+        name_ja: 外気温度計測値
+        get: required
+        set: notApplicable
+        description_en: This property indicates the measured outdoor air temperature.
+        description_ja: 外気温度計測値
+        format: int8
+        unit: Celsius
+        minimum: -127
+        maximum: 125
+      - epc: 0xC0
+        manufacturer_code: 0x000006
+        name_en: Ventilation function setting
+        name_ja: 換気モード設定
+        get: required
+        set: required
+        description_en: Used to specify whether or not to use the ventilation function, to specify the ventilation direction, and to acquire the current setting.
+        description_ja: 換気の動作を設定し、設定状態を取得する
+        enum_values:
+          - edt: 0x31
+            key: "off"
+            name_en: Ventilation function OFF
+            name_ja: 換気OFF
+          - edt: 0x42
+            key: "on"
+            name_en: Ventilation function ON
+            name_ja: 換気ON
+      - epc: 0xC2
+        manufacturer_code: 0x000006
+        name_en: Ventilation air flow rate setting
+        name_ja: 換気風量設定
+        get: required
+        set: required
+        description_en: Used to specify the ventilation air flow rate by selecting a level from among the predefined levels, and to acquire the current setting.
+        description_ja: 換気風量レベルを設定し、設定状態を取得する
+        enum_values:
+          - edt: 0x31
+            key: level_1
+            name_en: Level 1
+            name_ja: レベル1
+          - edt: 0x32
+            key: level_2
+            name_en: Level 2
+            name_ja: レベル2
+          - edt: 0x33
+            key: level_3
+            name_en: Level 3
+            name_ja: レベル3
+          - edt: 0x34
+            key: level_4
+            name_en: Level 4
+            name_ja: レベル4
+          - edt: 0x35
+            key: level_5
+            name_en: Level 5
+            name_ja: レベル5
+          - edt: 0x36
+            key: level_6
+            name_en: Level 6
+            name_ja: レベル6
+          - edt: 0x37
+            key: level_7
+            name_en: Level 7
+            name_ja: レベル7
+          - edt: 0x38
+            key: level_8
+            name_en: Level 8
+            name_ja: レベル8
+
+  0x0F02:
+    short_name: userDefinedDevice
+    name_en: User-defined device (0x0F02)
+    name_ja: ユーザ定義デバイス (0x0F02)
+    properties:
+      # 三菱エアリゾートVAV
+      # The EDT meanings are the opposite of the common 0x8F (power-saving
+      # operation setting: 0x41 = saving). This was confirmed on the device in
+      # sayurin/pyhems#39. "true" is the keep mode, which the property name
+      # refers to, regardless of the EDT value.
+      - epc: 0x8F
+        manufacturer_code: 0x000006
+        name_en: Keep operation setting
+        name_ja: キープ運転設定
+        get: required
+        set: required
+        description_en: This property indicates whether the VAV is operating in keep mode.
+        description_ja: VAVのキープ運転（節電機能）を設定し、状態を取得する
+        enum_values:
+          - edt: 0x41
+            key: "false"
+            name_en: Operating in normal mode
+            name_ja: キープOFF
+          - edt: 0x42
+            key: "true"
+            name_en: Operating in keep mode
+            name_ja: キープON
+      - epc: 0xB3
+        manufacturer_code: 0x000006
+        name_en: Set temperature value
+        name_ja: 温度設定値
+        get: required
+        set: required
+        description_en: Used to set the temperature and to acquire the current setting.
+        description_ja: 温度設定値を設定し、設定状態を取得する
+        format: uint8
+        unit: Celsius
+        minimum: 0
+        maximum: 50
+      - epc: 0xBB
+        manufacturer_code: 0x000006
+        name_en: Measured value of room temperature
+        name_ja: 室内温度計測値
+        get: optional
+        set: notApplicable
+        description_en: Measured value of room temperature
+        description_ja: 室内温度計測値
+        format: int8
+        unit: Celsius
+        minimum: -127
+        maximum: 125
+
+# Curated CollectionBinding entries (see pyhems.definitions.CollectionBinding).
+#
+# MRA does not document which count property backs which paged list result,
+# so this relationship must be curated by hand. Each entry is merged as a
+# CollectionBinding under DefinitionsRegistry.collection_bindings[class_code].
+#
+# Format:
+#   collection_bindings:
+#     - class_code: <class_code>       # 2-byte class code as hex
+#       result_epc: <epc_code>         # EPC holding the decoded list
+#       count_epc: <epc_code>          # Optional: EPC declaring total item count
+#       selector_epc: <epc_code>       # Optional: EPC selecting the result range
+#       max_range: <number>             # Optional: Maximum range per request
+#       items_path: [<field>, ...]     # Path (ObjectField keys) to the item list
+#       start_path: [<field>, ...]     # Path to the page's first index (1-based)
+#       page_count_path: [<field>, ...] # Path to the page's declared item count
+#       index_kind: channel             # Optional: default "channel"
+#   selector_epc/max_range also provide the one-shot recovery metadata used
+#   when a result list reports an unset range; they do not enable page switching.
+collection_bindings:
+  # Power distribution board metering (分電盤メータリング)
+  - class_code: 0x0287
+    result_epc: 0xB3
+    count_epc: 0xB1
+    selector_epc: 0xB2
+    max_range: 60
+    items_path: [electricEnergy]
+    start_path: [startChannel]
+    page_count_path: [range]
+  - class_code: 0x0287
+    result_epc: 0xB5
+    count_epc: 0xB1
+    selector_epc: 0xB4
+    max_range: 60
+    items_path: [instantaneousCurrent]
+    start_path: [startChannel]
+    page_count_path: [range]
+  - class_code: 0x0287
+    result_epc: 0xB7
+    count_epc: 0xB1
+    selector_epc: 0xB6
+    max_range: 60
+    items_path: [instantaneousElectricPower]
+    start_path: [startChannel]
+    page_count_path: [range]
+  - class_code: 0x0287
+    result_epc: 0xBA
+    count_epc: 0xB8
+    selector_epc: 0xB9
+    max_range: 30
+    items_path: [electricEnergy]
+    start_path: [startChannel]
+    page_count_path: [range]
+  - class_code: 0x0287
+    result_epc: 0xBC
+    count_epc: 0xB8
+    selector_epc: 0xBB
+    max_range: 60
+    items_path: [instantaneousCurrent]
+    start_path: [startChannel]
+    page_count_path: [range]
+  - class_code: 0x0287
+    result_epc: 0xBE
+    count_epc: 0xB8
+    selector_epc: 0xBD
+    max_range: 60
+    items_path: [instantaneousElectricPower]
+    start_path: [startChannel]
+    page_count_path: [range]

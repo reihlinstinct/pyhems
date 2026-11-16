@@ -1,0 +1,40 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+      - id: debug-statements
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.13.0
+    hooks:
+      - id: ruff-check
+        args:
+          - --fix
+      - id: ruff-format
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        # Manufacturer names are not subject to spell checking.
+        exclude: ^scripts/manufacturer_codes\.yaml$
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.1
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - bidict
+          - pytest
+          - types-PyYAML
+  - repo: local
+    hooks:
+      - id: check-generated-definitions
+        name: Check generated definitions
+        entry: uv run scripts/generate_definitions.py --check
+        language: system
+        pass_filenames: false
+        always_run: true
+exclude: ^(mra/|src/pyhems/_definitions_generated\.py)

@@ -1,0 +1,2023 @@
+"""Tests for runtime client."""
+
+import asyncio
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, call, patch
+
+import pytest
+
+from pyhems import (
+    CONTROLLER_INSTANCE,
+    ECHONET_MULTICAST,
+    EOJ,
+    EPC,
+    ESV,
+    NODE_PROFILE_INSTANCE,
+    Frame,
+    Property,
+    SetRequestResult,
+)
+from pyhems.runtime import (
+    _MAX_PENDING_ADDRESSES,
+    _MAX_PENDING_FRAMES_PER_ADDRESS,
+    ClientStoppedError,
+    GetAbortedError,
+    HemsClient,
+    HemsErrorEvent,
+    HemsFrameEvent,
+    HemsInstanceListEvent,
+    RuntimeEvent,
+    _GetCapability,
+)
+from pyhems.transport import EchonetLiteProtocol
+
+
+class TestRuntimeEvents:
+    """Tests for runtime event classes."""
+
+    def test_runtime_event_has_received_at(self) -> None:
+        """Test RuntimeEvent has received_at timestamp."""
+        event = RuntimeEvent(received_at=1.0)
+        assert event.received_at == 1.0
+
+    def test_frame_event_fields(self) -> None:
+        """Test HemsFrameEvent field values."""
+        frame = Frame(
+            tid=1,
+            seoj=EOJ(0x010101),
+            deoj=EOJ(0x020202),
+            esv=ESV.GET_RES,
+        )
+        event = HemsFrameEvent(
+            received_at=1.0,
+            frame=frame,
+            node_id="abc123",
+            eoj=EOJ(0x010101),
+        )
+        assert event.received_at == 1.0
+        assert event.frame == frame
+        assert event.node_id == "abc123"
+        assert event.eoj == EOJ(0x010101)
+
+    def test_instance_list_event_fields(self) -> None:
+        """Test HemsInstanceListEvent field values."""
+        event = HemsInstanceListEvent(
+            received_at=2.0,
+            instances=[EOJ(0x010101), EOJ(0x013001)],
+            node_id="def456",
+        )
+        assert event.received_at == 2.0
+        assert event.instances == [EOJ(0x010101), EOJ(0x013001)]
+        assert event.node_id == "def456"
+
+    def test_error_event_fields(self) -> None:
+        """Test HemsErrorEvent field values."""
+        error = RuntimeError("test error")
+        event = HemsErrorEvent(received_at=3.0, error=error)
+        assert event.received_at == 3.0
+        assert event.error == error
+
+
+class TestHemsClient:
+    """Tests for HemsClient class."""
+
+    def test_client_init(self) -> None:
+        """Test client initialization."""
+        client = HemsClient(interface="192.168.1.1", discovery_interval=30.0)
+        assert client._interface == "192.168.1.1"
+        assert client._discovery_interval == 30.0
+
+    def test_client_default_discovery_interval_is_one_hour(self) -> None:
+        """Test recurring discovery defaults to one hour."""
+        assert HemsClient()._discovery_interval == 60.0 * 60.0
+
+    def test_subscribe_unsubscribe(self) -> None:
+        """Test subscribing and unsubscribing callbacks."""
+        client = HemsClient()
+        events: list[RuntimeEvent] = []
+
+        def callback(event: RuntimeEvent) -> None:
+            events.append(event)
+
+        unsubscribe = client.subscribe(callback)
+        assert callback in client._callbacks
+
+        # Dispatch an event
+        event = RuntimeEvent(received_at=1.0)
+        client._dispatch(event)
+        assert len(events) == 1
+
+        # Unsubscribe
+        unsubscribe()
+        assert callback not in client._callbacks
+
+        # Dispatch another event - should not be received
+        client._dispatch(RuntimeEvent(received_at=2.0))
+        assert len(events) == 1
+
+    def test_device_address_mapping(self) -> None:
+        """Test device address mapping."""
+        client = HemsClient()
+        identification = "fe00000000000000000000000000000001"
+
+        client._device_addresses.forceput("192.168.1.100", identification)
+        assert client._device_addresses.get("192.168.1.100") == identification
+        assert client._device_addresses.inverse.get(identification) == "192.168.1.100"
+
+        # Unknown device returns None
+        unknown = "fe00000000000000000000000000000002"
+        assert client._device_addresses.inverse.get(unknown) is None
+
+    @pytest.mark.asyncio
+    async def test_set_property_waits_for_set_res(self) -> None:
+        """Test set_property builds a SetC frame and waits for Set_Res."""
+        client = HemsClient()
+        mock_protocol = MagicMock()
+        client._protocol = mock_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.100", node_id)
+
+        request = asyncio.create_task(
+            client.set_property(
+                node_id=node_id,
+                deoj=EOJ(0x013001),
+                epc=0x80,
+                edt=b"\x30",
+            )
+        )
+        await asyncio.sleep(0)
+
+        tid = next(iter(client._pending))
+        mock_protocol.send.assert_called_once()
+        payload, address = mock_protocol.send.call_args.args
+        assert address == "192.168.1.100"
+        frame = Frame.decode(payload)
+        assert frame.esv == ESV.SETC
+        assert frame.tid == tid
+        assert frame.deoj == EOJ(0x013001)
+        assert frame.properties == [Property(epc=0x80, edt=b"\x30")]
+
+        client._on_receive(
+            Frame(
+                tid=tid,
+                seoj=EOJ(0x013001),
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.SET_RES,
+            ).encode(),
+            ("192.168.1.100", 3610),
+        )
+
+        result = await request
+        assert result == SetRequestResult(
+            sent=True,
+            response_esv=ESV.SET_RES,
+            accepted_epcs=frozenset({0x80}),
+            rejected_epcs=frozenset(),
+            unanswered_epcs=frozenset(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_properties_without_properties_returns_unsent(self) -> None:
+        """Test set_properties returns an unsent result when empty."""
+        client = HemsClient()
+        result = await client.set_properties(
+            node_id="fe00000000000000000000000000000001",
+            deoj=EOJ(0x013001),
+            properties=[],
+        )
+        assert result == SetRequestResult(
+            sent=False,
+            response_esv=None,
+            accepted_epcs=frozenset(),
+            rejected_epcs=frozenset(),
+            unanswered_epcs=frozenset(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_set_properties_classifies_setc_sna(self) -> None:
+        """Test SetC_SNA classifies accepted, rejected, and unanswered EPCs."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.100", node_id)
+
+        request = asyncio.create_task(
+            client.set_properties(
+                node_id=node_id,
+                deoj=EOJ(0x013001),
+                properties=[
+                    Property(epc=0x80, edt=b"\x30"),
+                    Property(epc=0xB0, edt=b"\x40"),
+                    Property(epc=0xB1, edt=b"\x41"),
+                ],
+            )
+        )
+        await asyncio.sleep(0)
+
+        tid = next(iter(client._pending))
+        client._on_receive(
+            Frame(
+                tid=tid,
+                seoj=EOJ(0x013001),
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.SETC_SNA,
+                properties=[
+                    Property(epc=0x80),
+                    Property(epc=0xB0, edt=b"\x40"),
+                ],
+            ).encode(),
+            ("192.168.1.100", 3610),
+        )
+
+        result = await request
+        assert result.response_esv == ESV.SETC_SNA
+        assert result.accepted_epcs == frozenset({0x80})
+        assert result.rejected_epcs == frozenset({0xB0})
+        assert result.unanswered_epcs == frozenset({0xB1})
+
+    @pytest.mark.asyncio
+    async def test_set_properties_timeout(self) -> None:
+        """Test an acknowledged SetC request that receives no response."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.100", node_id)
+
+        result = await client.set_properties(
+            node_id=node_id,
+            deoj=EOJ(0x013001),
+            properties=[Property(epc=0x80, edt=b"\x30")],
+            request_timeout=0.01,
+        )
+
+        assert result.sent is True
+        assert result.response_esv is None
+        assert result.unanswered_epcs == frozenset({0x80})
+        assert not client._pending
+
+
+class TestNodeProbe:
+    """Tests for node probe functionality."""
+
+    @staticmethod
+    def _simulate_receive(client: HemsClient, frame: Frame, address: str) -> None:
+        """Simulate receiving a frame via _on_receive."""
+        frame_data = frame.encode()
+        client._on_receive(frame_data, (address, 3610))
+
+    def test_next_transaction_id(self) -> None:
+        """Test transaction IDs are per client, skip 0 and wrap around."""
+        client = HemsClient()
+        assert client._next_transaction_id() == 1
+        assert client._next_transaction_id() == 2
+        assert HemsClient()._next_transaction_id() == 1
+
+        client._tid_counter = 0xFFFF
+        assert client._next_transaction_id() == 1
+
+    def test_probe_nodes_not_running(self) -> None:
+        """Test probe fails when not running."""
+        client = HemsClient()
+        result = client.probe_nodes()
+        assert result is False
+
+    def test_probe_nodes_sends_correct_frame(self) -> None:
+        """Test probe sends correct Get request with default EPCs."""
+        client = HemsClient()
+
+        # Mock protocol
+        mock_protocol = MagicMock()
+        client._protocol = mock_protocol
+
+        result = client.probe_nodes()
+        assert result is True
+
+        # Verify send was called
+        mock_protocol.send.assert_called_once()
+        call_args = mock_protocol.send.call_args
+        data, address = call_args[0]
+
+        # Verify address is multicast address (not a tuple)
+        assert address == ECHONET_MULTICAST
+
+        # Decode the frame to verify
+        frame = Frame.decode(data)
+        assert frame.seoj == CONTROLLER_INSTANCE
+        assert frame.deoj == NODE_PROFILE_INSTANCE
+        assert frame.esv == ESV.GET
+        # Recurring discovery only requests the self-node instance list.
+        assert len(frame.properties) == 1
+
+        epcs = [p.epc for p in frame.properties]
+        assert EPC.SELF_NODE_INSTANCE_LIST in epcs
+        assert epcs == [EPC.SELF_NODE_INSTANCE_LIST]
+
+    @pytest.mark.asyncio
+    async def test_start_starts_periodic_discovery_after_initial_delay(self) -> None:
+        """Test that start performs initial and recurring discovery."""
+        with (
+            patch(
+                "pyhems.runtime.create_multicast_socket", new_callable=AsyncMock
+            ) as mock_create,
+        ):
+            mock_protocol = MagicMock()
+            mock_create.return_value = mock_protocol
+
+            client = HemsClient(discovery_interval=60.0)
+            with (
+                patch.object(
+                    client, "probe_initial_nodes", return_value=True
+                ) as initial_probe,
+                patch.object(
+                    client,
+                    "start_periodic_discovery",
+                    wraps=client.start_periodic_discovery,
+                ) as periodic_start,
+            ):
+                await client.start()
+
+            assert client._protocol is not None
+            assert client._discovery_task is not None
+            initial_probe.assert_called_once_with()
+            periodic_start.assert_called_once_with()
+
+            # Clean up
+            await client.stop()
+            assert client._protocol is None
+            assert client._discovery_task is None
+            # Ensure protocol is closed (protocol manages transport internally)
+            mock_protocol.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_start_raises_and_closes_protocol_when_probe_fails(
+        self,
+    ) -> None:
+        """Test that a failed initial probe aborts startup and closes the protocol."""
+        with patch(
+            "pyhems.runtime.create_multicast_socket", new_callable=AsyncMock
+        ) as mock_create:
+            mock_protocol = MagicMock()
+            mock_create.return_value = mock_protocol
+
+            client = HemsClient()
+            with (
+                patch.object(client, "probe_initial_nodes", return_value=False),
+                patch.object(
+                    client,
+                    "start_periodic_discovery",
+                    wraps=client.start_periodic_discovery,
+                ) as periodic_start,
+                pytest.raises(
+                    OSError,
+                    match="Initial ECHONET Lite node discovery could not be sent",
+                ),
+            ):
+                await client.start()
+
+            assert client._discovery_task is None
+            assert client._protocol is None
+            periodic_start.assert_not_called()
+            mock_protocol.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_start_can_retry_after_initial_probe_failure(self) -> None:
+        """Test that startup can be retried after an initial probe failure."""
+        with patch(
+            "pyhems.runtime.create_multicast_socket", new_callable=AsyncMock
+        ) as mock_create:
+            failed_protocol = MagicMock()
+            working_protocol = MagicMock()
+            mock_create.side_effect = [failed_protocol, working_protocol]
+
+            client = HemsClient()
+            with patch.object(
+                client, "probe_initial_nodes", side_effect=[False, True]
+            ) as initial_probe:
+                with pytest.raises(
+                    OSError,
+                    match="Initial ECHONET Lite node discovery could not be sent",
+                ):
+                    await client.start()
+                await client.start()
+
+            initial_probe.assert_has_calls([call(), call()])
+            assert client._protocol is working_protocol
+            assert client._discovery_task is not None
+
+            await client.stop()
+            failed_protocol.close.assert_called_once()
+            working_protocol.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_discovery_loop_probes_before_waiting_for_next_interval(self) -> None:
+        """Test that the first periodic probe is sent immediately."""
+        client = HemsClient(discovery_interval=60.0)
+        client._protocol = MagicMock()
+
+        with (
+            patch(
+                "pyhems.runtime.asyncio.sleep",
+                new_callable=AsyncMock,
+                side_effect=[None, asyncio.CancelledError],
+            ) as mock_sleep,
+            patch.object(client, "probe_nodes") as mock_probe,
+            patch("pyhems.runtime._INITIAL_DISCOVERY_DELAY", 30.0),
+        ):
+            await client._discovery_loop()
+
+        mock_probe.assert_called_once_with()
+        assert mock_sleep.await_args_list == [call(30.0), call(60.0)]
+
+    @pytest.mark.asyncio
+    async def test_known_node_profile_d6_response_dispatches_instance_list(
+        self,
+    ) -> None:
+        """A D6 response from a known address updates its instance list."""
+        client = HemsClient()
+        events: list[RuntimeEvent] = []
+        client.subscribe(events.append)
+        address = "192.168.1.100"
+        node_id = (b"\xfe" + b"\x00" * 16).hex()
+        client._device_addresses.forceput(address, node_id)
+
+        self._simulate_receive(
+            client,
+            Frame(
+                tid=1,
+                seoj=NODE_PROFILE_INSTANCE,
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.GET_RES,
+                properties=[
+                    Property(
+                        epc=EPC.SELF_NODE_INSTANCE_LIST,
+                        edt=bytes([1, 0x01, 0x30, 0x01]),
+                    )
+                ],
+            ),
+            address,
+        )
+
+        assert len(events) == 1
+        assert isinstance(events[0], HemsInstanceListEvent)
+        assert events[0].node_id == node_id
+        assert events[0].instances == [EOJ(0x013001)]
+
+    @pytest.mark.asyncio
+    async def test_unknown_node_profile_d6_response_starts_direct_discovery(
+        self,
+    ) -> None:
+        """An unknown D6 response is resolved without using its instance list."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        address = "192.168.1.101"
+
+        self._simulate_receive(
+            client,
+            Frame(
+                tid=1,
+                seoj=NODE_PROFILE_INSTANCE,
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.GET_RES,
+                properties=[
+                    Property(
+                        epc=EPC.SELF_NODE_INSTANCE_LIST,
+                        edt=bytes([1, 0x01, 0x30, 0x01]),
+                    )
+                ],
+            ),
+            address,
+        )
+        await asyncio.sleep(0)
+
+        payload, destination = client._protocol.send.call_args.args
+        request = Frame.decode(payload)
+        assert destination == address
+        assert request.deoj == NODE_PROFILE_INSTANCE
+        assert request.esv == ESV.GET
+        assert [prop.epc for prop in request.properties] == [
+            EPC.IDENTIFICATION_NUMBER,
+            EPC.SELF_NODE_INSTANCE_LIST,
+        ]
+        assert address in client._address_discovery_tasks
+        await client.stop()
+
+    @pytest.mark.asyncio
+    async def test_process_frame_dispatches_instance_list_event(self) -> None:
+        """Test that Get_Res with instance list dispatches event."""
+        client = HemsClient()
+        events: list[RuntimeEvent] = []
+        client.subscribe(events.append)
+
+        # Create a Get_Res frame from node profile
+        # with identification number and instance list
+        identification = b"\xfe" + b"\x00" * 16
+        identification_hex = identification.hex()
+        instance_list = bytes([2, 0x01, 0x30, 0x01, 0x02, 0x87, 0x01])
+
+        frame = Frame(
+            tid=1,
+            seoj=NODE_PROFILE_INSTANCE,
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.GET_RES,
+            properties=[
+                Property(epc=EPC.IDENTIFICATION_NUMBER, edt=identification),
+                Property(epc=EPC.SELF_NODE_INSTANCE_LIST, edt=instance_list),
+            ],
+        )
+
+        self._simulate_receive(client, frame, "192.168.1.100")
+
+        # Should dispatch HemsInstanceListEvent
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, HemsInstanceListEvent)
+        assert event.node_id == identification_hex
+        assert event.instances == [EOJ(0x013001), EOJ(0x028701)]
+
+        # Address should be registered
+        assert (
+            client._device_addresses.inverse.get(identification_hex) == "192.168.1.100"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_node_profile_inf_discovers_source_address(self) -> None:
+        """Test a node-profile INF discovers its unknown source address."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        events: list[RuntimeEvent] = []
+        client.subscribe(events.append)
+        address = "192.168.1.101"
+        identification = b"\xfe" + b"\x00" * 16
+        instance_list = bytes([1, 0x01, 0x30, 0x01])
+
+        self._simulate_receive(
+            client,
+            Frame(
+                tid=1,
+                seoj=NODE_PROFILE_INSTANCE,
+                deoj=NODE_PROFILE_INSTANCE,
+                esv=ESV.INF,
+                properties=[Property(epc=EPC.INSTANCE_LIST, edt=instance_list)],
+            ),
+            address,
+        )
+        await asyncio.sleep(0)
+
+        payload, destination = client._protocol.send.call_args.args
+        request = Frame.decode(payload)
+        assert destination == address
+        assert request.deoj == NODE_PROFILE_INSTANCE
+        assert request.esv == ESV.GET
+        assert [
+            prop.epc for prop in request.properties
+        ] == client._initial_discovery_epcs
+
+        self._simulate_receive(
+            client,
+            Frame(
+                tid=next(iter(client._pending)),
+                seoj=NODE_PROFILE_INSTANCE,
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.GET_RES,
+                properties=[
+                    Property(epc=EPC.IDENTIFICATION_NUMBER, edt=identification),
+                    Property(epc=EPC.MANUFACTURER_CODE, edt=b"\x00\x00\x01"),
+                    Property(epc=EPC.PRODUCT_CODE, edt=b"PRODUCT"),
+                    Property(epc=EPC.SERIAL_NUMBER, edt=b"SERIAL"),
+                    Property(epc=EPC.SELF_NODE_INSTANCE_LIST, edt=instance_list),
+                ],
+            ),
+            address,
+        )
+        await asyncio.sleep(0)
+        await client._address_discovery_tasks[address]
+        await asyncio.sleep(0)
+
+        assert len(events) == 1
+        assert isinstance(events[0], HemsInstanceListEvent)
+        assert events[0].instances == [EOJ(0x013001)]
+        assert client._device_addresses[address] == identification.hex()
+        assert address not in client._address_discovery_tasks
+
+    @pytest.mark.asyncio
+    async def test_unknown_device_inf_is_replayed_after_discovery(self) -> None:
+        """Test an unknown device INF is replayed after its instances are found."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        events: list[RuntimeEvent] = []
+        client.subscribe(events.append)
+        address = "192.168.1.102"
+        device_eoj = EOJ(0x013001)
+        identification = b"\xfe" + b"\x01" * 16
+        instance_list = bytes([1, *device_eoj.to_bytes()])
+        notification = Frame(
+            tid=1,
+            seoj=device_eoj,
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.INF,
+            properties=[Property(epc=0x80, edt=b"\x30")],
+        )
+
+        self._simulate_receive(client, notification, address)
+        await asyncio.sleep(0)
+        self._simulate_receive(
+            client,
+            Frame(
+                tid=next(iter(client._pending)),
+                seoj=NODE_PROFILE_INSTANCE,
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.GET_RES,
+                properties=[
+                    Property(epc=EPC.IDENTIFICATION_NUMBER, edt=identification),
+                    Property(epc=EPC.SELF_NODE_INSTANCE_LIST, edt=instance_list),
+                ],
+            ),
+            address,
+        )
+        await asyncio.sleep(0)
+
+        assert len(events) == 2
+        instance_event, frame_event = events
+        assert isinstance(instance_event, HemsInstanceListEvent)
+        assert isinstance(frame_event, HemsFrameEvent)
+        assert frame_event.frame == notification
+        assert frame_event.node_id == identification.hex()
+
+    @pytest.mark.asyncio
+    async def test_unknown_inf_discovers_address_once(self) -> None:
+        """Test repeated INF frames from an unknown address share discovery."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        address = "192.168.1.103"
+        notification = Frame(
+            tid=1,
+            seoj=EOJ(0x013001),
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.INF,
+            properties=[Property(epc=0x80, edt=b"\x30")],
+        )
+
+        self._simulate_receive(client, notification, address)
+        self._simulate_receive(client, notification, address)
+        await asyncio.sleep(0)
+
+        assert client._protocol.send.call_count == 1
+        assert len(client._address_discovery_tasks) == 1
+        await client.stop()
+
+    @pytest.mark.asyncio
+    async def test_failed_unknown_inf_discovery_discards_pending_frames(self) -> None:
+        """Test failed direct discovery discards the pending notification."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        address = "192.168.1.104"
+        notification = Frame(
+            tid=1,
+            seoj=EOJ(0x013001),
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.INF,
+            properties=[Property(epc=0x80, edt=b"\x30")],
+        )
+
+        with patch.object(
+            client, "_get_at_address", new_callable=AsyncMock, return_value=None
+        ):
+            self._simulate_receive(client, notification, address)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        assert address not in client._pending_frames
+        assert address not in client._address_discovery_tasks
+
+    @pytest.mark.asyncio
+    async def test_process_frame_discards_request_esv(self) -> None:
+        """Test that request ESVs (0x60-0x6F) are discarded."""
+        client = HemsClient()
+        events: list[RuntimeEvent] = []
+        client.subscribe(events.append)
+
+        # Create a Get request frame (ESV=0x62, should be discarded)
+        frame = Frame(
+            tid=1,
+            seoj=CONTROLLER_INSTANCE,
+            deoj=NODE_PROFILE_INSTANCE,
+            esv=ESV.GET,
+            properties=[Property(epc=EPC.IDENTIFICATION_NUMBER)],
+        )
+
+        self._simulate_receive(client, frame, "192.168.1.100")
+
+        # No events should be dispatched
+        assert len(events) == 0
+
+    @pytest.mark.asyncio
+    async def test_process_frame_requires_identification_for_non_node_profile(
+        self,
+    ) -> None:
+        """Test that non-node-profile frames require known identification."""
+        client = HemsClient()
+        events: list[RuntimeEvent] = []
+        client.subscribe(events.append)
+
+        # Create a Get_Res frame from a device (not node profile)
+        frame = Frame(
+            tid=1,
+            seoj=EOJ(0x013001),  # Air conditioner
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.GET_RES,
+            properties=[Property(epc=0x80, edt=b"\x30")],  # Power status
+        )
+
+        # Device not registered - should not dispatch
+        self._simulate_receive(client, frame, "192.168.1.100")
+        assert len(events) == 0
+
+        # Register device and try again
+        identification = (b"\xfe" + b"\x00" * 16).hex()
+        client._device_addresses.forceput("192.168.1.100", identification)
+
+        self._simulate_receive(client, frame, "192.168.1.100")
+
+        # Now should dispatch
+        assert len(events) == 1
+        event = events[0]
+        assert isinstance(event, HemsFrameEvent)
+        assert event.node_id == identification
+
+    @pytest.mark.asyncio
+    async def test_bidict_reverse_lookup(self) -> None:
+        """Test bidict allows reverse lookup by identification."""
+        client = HemsClient()
+        identification_bytes = b"\xfe" + b"\x00" * 16
+        identification = identification_bytes.hex()
+
+        client._device_addresses.forceput("192.168.1.100", identification)
+
+        # Forward lookup: address -> identification
+        assert client._device_addresses.get("192.168.1.100") == identification
+
+        # Reverse lookup: identification -> address
+        assert client._device_addresses.inverse.get(identification) == "192.168.1.100"
+
+    @pytest.mark.asyncio
+    async def test_bidict_forceput_handles_address_change(self) -> None:
+        """Test that address changes are handled correctly with forceput."""
+        client = HemsClient()
+        events: list[RuntimeEvent] = []
+        client.subscribe(events.append)
+
+        identification_bytes = b"\xfe" + b"\x00" * 16
+        identification_hex = identification_bytes.hex()
+        instance_list = bytes([1, 0x01, 0x30, 0x01])
+
+        # First probe response from 192.168.1.100
+        frame1 = Frame(
+            tid=1,
+            seoj=NODE_PROFILE_INSTANCE,
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.GET_RES,
+            properties=[
+                Property(epc=EPC.IDENTIFICATION_NUMBER, edt=identification_bytes),
+                Property(epc=EPC.SELF_NODE_INSTANCE_LIST, edt=instance_list),
+            ],
+        )
+        self._simulate_receive(client, frame1, "192.168.1.100")
+        assert (
+            client._device_addresses.inverse.get(identification_hex) == "192.168.1.100"
+        )
+
+        deoj = EOJ(0x013001)
+        client._get_capabilities[(identification_hex, deoj)] = _GetCapability(
+            observed_batch_capacity=1
+        )
+        assert (identification_hex, deoj) in client._get_capabilities
+
+        # Device gets new IP address (192.168.1.200)
+        frame2 = Frame(
+            tid=2,
+            seoj=NODE_PROFILE_INSTANCE,
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.GET_RES,
+            properties=[
+                Property(epc=EPC.IDENTIFICATION_NUMBER, edt=identification_bytes),
+                Property(epc=EPC.SELF_NODE_INSTANCE_LIST, edt=instance_list),
+            ],
+        )
+        self._simulate_receive(client, frame2, "192.168.1.200")
+
+        # Address should be updated
+        assert (
+            client._device_addresses.inverse.get(identification_hex) == "192.168.1.200"
+        )
+
+        # Direct lookup should also work
+        assert client._device_addresses.get("192.168.1.200") == identification_hex
+        # Old address should no longer be mapped, but node capability remains.
+        assert client._device_addresses.get("192.168.1.100") is None
+        assert (identification_hex, deoj) in client._get_capabilities
+
+
+class TestAsyncGet:
+    """Tests for the public get method."""
+
+    @staticmethod
+    def _simulate_receive(client: HemsClient, frame: Frame, address: str) -> None:
+        """Simulate receiving a frame via _on_receive."""
+        frame_data = frame.encode()
+        client._on_receive(frame_data, (address, 3610))
+
+    @pytest.fixture
+    def client_with_protocol(self) -> HemsClient:
+        """Create a client with mocked protocol."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        client._protocol.send = MagicMock()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_async_get_success(self, client_with_protocol: HemsClient) -> None:
+        """Test get with successful 0x72 response."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        # Start the get request
+        get_task = asyncio.create_task(
+            client.get(node_id, EOJ(0x013001), [0x80, 0xB0], request_timeout=1.0)
+        )
+
+        # Give time for request to be registered
+        await asyncio.sleep(0.01)
+
+        # Simulate receiving response
+        tid = next(iter(client._pending))
+        response_frame = Frame(
+            tid=tid,
+            seoj=EOJ(0x013001),
+            deoj=EOJ(0x05FF01),
+            esv=ESV.GET_RES,
+            properties=[
+                Property(epc=0x80, edt=b"\x30"),
+                Property(epc=0xB0, edt=b"\x42"),
+            ],
+        )
+        self._simulate_receive(client, response_frame, "192.168.1.10")
+
+        result = await get_task
+        assert len(result) == 2
+        assert result[0].epc == 0x80
+        assert result[0].edt == b"\x30"
+        assert result[1].epc == 0xB0
+        assert result[1].edt == b"\x42"
+
+    @pytest.mark.asyncio
+    async def test_async_get_applies_manufacturer_batch_policy(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """Manufacturer lookup precedes policy batches and result order is restored."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        address = "192.168.1.10"
+        deoj = EOJ(0x028701)
+        requested_epcs = [0xC0, 0xC1, 0xC2, 0xB3, 0xB7, 0xB8, 0xBA]
+        client._device_addresses.forceput(address, node_id)
+
+        get_task = asyncio.create_task(
+            client.get(node_id, deoj, requested_epcs, request_timeout=1.0)
+        )
+        await asyncio.sleep(0.01)
+
+        assert client._protocol is not None
+        send: Any = client._protocol.send
+        tid = next(iter(client._pending))
+        sent_epcs = [
+            prop.epc for prop in Frame.decode(send.call_args.args[0]).properties
+        ]
+        assert sent_epcs == [0x8A]
+        self._simulate_receive(
+            client,
+            Frame(
+                tid=tid,
+                seoj=deoj,
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.GET_RES,
+                properties=[Property(epc=0x8A, edt=b"\x00\x00\x0b")],
+            ),
+            address,
+        )
+
+        await asyncio.sleep(0.01)
+        tid = next(iter(client._pending))
+        first_batch = [
+            prop.epc for prop in Frame.decode(send.call_args.args[0]).properties
+        ]
+        assert first_batch == [0xC0, 0xC1, 0xC2, 0xB3, 0xB8, 0xBA]
+        self._simulate_receive(
+            client,
+            Frame(
+                tid=tid,
+                seoj=deoj,
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.GET_RES,
+                properties=[Property(epc=epc, edt=bytes([epc])) for epc in first_batch],
+            ),
+            address,
+        )
+
+        await asyncio.sleep(0.01)
+        tid = next(iter(client._pending))
+        second_batch = [
+            prop.epc for prop in Frame.decode(send.call_args.args[0]).properties
+        ]
+        assert second_batch == [0xB7]
+        self._simulate_receive(
+            client,
+            Frame(
+                tid=tid,
+                seoj=deoj,
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.GET_RES,
+                properties=[Property(epc=0xB7, edt=b"\xb7")],
+            ),
+            address,
+        )
+
+        result = await get_task
+        assert [prop.epc for prop in result] == requested_epcs
+        assert [prop.edt for prop in result] == [bytes([epc]) for epc in requested_epcs]
+        capability = client._get_capabilities[(node_id, deoj)]
+        assert capability.manufacturer_code == 0x00000B
+        assert capability.observed_batch_capacity is None
+
+    @pytest.mark.asyncio
+    async def test_async_get_applies_manufacturer_batch_size_cap(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """A manufacturer cap splits the first setup GET without a timeout."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        address = "192.168.1.10"
+        deoj = EOJ(0x029001)
+        requested_epcs = list(range(0x80, 0x80 + 28))
+        client._device_addresses.forceput(address, node_id)
+
+        get_task = asyncio.create_task(
+            client.setup_get(node_id, deoj, requested_epcs, request_timeout=1.0)
+        )
+        await asyncio.sleep(0.01)
+
+        assert client._protocol is not None
+        send: Any = client._protocol.send
+        tid = next(iter(client._pending))
+        sent_epcs = [
+            prop.epc for prop in Frame.decode(send.call_args.args[0]).properties
+        ]
+        assert sent_epcs == [0x8A]
+        self._simulate_receive(
+            client,
+            Frame(
+                tid=tid,
+                seoj=deoj,
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.GET_RES,
+                properties=[Property(epc=0x8A, edt=b"\x00\x00\xe8")],
+            ),
+            address,
+        )
+
+        sent_batches: list[list[int]] = []
+        for _ in range(2):
+            await asyncio.sleep(0.01)
+            tid = next(iter(client._pending))
+            batch = [
+                prop.epc for prop in Frame.decode(send.call_args.args[0]).properties
+            ]
+            sent_batches.append(batch)
+            self._simulate_receive(
+                client,
+                Frame(
+                    tid=tid,
+                    seoj=deoj,
+                    deoj=CONTROLLER_INSTANCE,
+                    esv=ESV.GET_SNA,
+                    properties=[Property(epc=epc, edt=bytes([epc])) for epc in batch],
+                ),
+                address,
+            )
+
+        result = await get_task
+        remaining_epcs = [epc for epc in requested_epcs if epc != 0x8A]
+        assert [len(batch) for batch in sent_batches] == [14, 13]
+        assert sent_batches == [remaining_epcs[:14], remaining_epcs[14:]]
+        assert [prop.epc for prop in result] == requested_epcs
+        capability = client._get_capabilities[(node_id, deoj)]
+        assert capability.manufacturer_code == 0x0000E8
+        assert capability.observed_batch_capacity == 14
+
+    @pytest.mark.asyncio
+    async def test_async_get_partial_missing_epc_retry(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """Test get retries when some EPCs are missing from response."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        async def run_test() -> list[Property]:
+            return [
+                Property(epc=property.epc, edt=property.edt)
+                for property in await client.get(
+                    node_id, EOJ(0x013001), [0x80, 0xB0, 0xBB], request_timeout=1.0
+                )
+            ]
+
+        get_task = asyncio.create_task(run_test())
+
+        # First response: partial (0x52), only 0x80 present
+        # 0xB0 and 0xBB are completely missing from the response
+        await asyncio.sleep(0.01)
+        if client._pending:
+            tid1 = next(iter(client._pending))
+            response1 = Frame(
+                tid=tid1,
+                seoj=EOJ(0x013001),
+                deoj=EOJ(0x05FF01),
+                esv=ESV.GET_SNA,
+                properties=[
+                    Property(epc=0x80, edt=b"\x30"),  # Success
+                ],
+            )
+            self._simulate_receive(client, response1, "192.168.1.10")
+
+        # Second response: retry succeeds for remaining
+        await asyncio.sleep(0.01)
+        if client._pending:
+            tid2 = next(iter(client._pending))
+            response2 = Frame(
+                tid=tid2,
+                seoj=EOJ(0x013001),
+                deoj=EOJ(0x05FF01),
+                esv=ESV.GET_RES,
+                properties=[
+                    Property(epc=0xB0, edt=b"\x45"),  # FAN mode
+                    Property(epc=0xBB, edt=b"\x1a"),  # Temperature
+                ],
+            )
+            self._simulate_receive(client, response2, "192.168.1.10")
+
+        result = await get_task
+        assert len(result) == 3
+        # Results in original request order
+        assert result[0].epc == 0x80
+        assert result[0].edt == b"\x30"
+        assert result[1].epc == 0xB0
+        assert result[1].edt == b"\x45"
+        assert result[2].epc == 0xBB
+        assert result[2].edt == b"\x1a"
+
+    @pytest.mark.asyncio
+    async def test_async_get_sna_no_retry(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """Test get does NOT retry for SNA (empty value) properties."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        async def run_test() -> list[Property]:
+            return [
+                Property(epc=property.epc, edt=property.edt)
+                for property in await client.get(
+                    node_id, EOJ(0x013001), [0x80, 0xB0], request_timeout=1.0
+                )
+            ]
+
+        get_task = asyncio.create_task(run_test())
+
+        # Response: 0x80 success, 0xB0 SNA (empty)
+        await asyncio.sleep(0.01)
+        if client._pending:
+            tid1 = next(iter(client._pending))
+            response1 = Frame(
+                tid=tid1,
+                seoj=EOJ(0x013001),
+                deoj=EOJ(0x05FF01),
+                esv=ESV.GET_SNA,
+                properties=[
+                    Property(epc=0x80, edt=b"\x30"),  # Success
+                    Property(epc=0xB0, edt=b""),  # SNA (empty)
+                ],
+            )
+            self._simulate_receive(client, response1, "192.168.1.10")
+
+        # Should finish immediately without retry
+        result = await get_task
+        assert len(result) == 2
+        assert result[0].epc == 0x80
+        assert result[0].edt == b"\x30"
+        assert result[1].epc == 0xB0
+        assert result[1].edt == b""  # Empty value returned
+
+    @pytest.mark.asyncio
+    async def test_async_get_timeout(self, client_with_protocol: HemsClient) -> None:
+        """Test get times out and returns empty properties."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        result = await client.get(
+            node_id, EOJ(0x013001), [0x80, 0xB0], request_timeout=0.1
+        )
+
+        # The request is not retried, and failed EPCs are returned empty.
+        assert client._protocol is not None
+        assert cast(MagicMock, client._protocol.send).call_count == 1
+        assert client._pending == {}
+        assert len(result) == 2
+        assert result[0].epc == 0x80
+        assert result[0].edt == b""
+        assert result[1].epc == 0xB0
+        assert result[1].edt == b""
+
+    @pytest.mark.asyncio
+    async def test_async_get_empty_epcs(self, client_with_protocol: HemsClient) -> None:
+        """Test get with empty EPC list returns empty."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+        result = await client.get(node_id, EOJ(0x013001), [])
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_async_get_no_protocol(self) -> None:
+        """Test get without protocol returns an empty value per EPC."""
+        client = HemsClient()
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+        # client._protocol is None
+        result = await client.get(node_id, EOJ(0x013001), [0x80, 0xB0])
+        assert result == [Property(epc=0x80, edt=b""), Property(epc=0xB0, edt=b"")]
+
+    @pytest.mark.asyncio
+    async def test_async_get_unknown_node(self) -> None:
+        """Test get for an unknown node returns an empty value per EPC."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+
+        result = await client.get("unknown", EOJ(0x013001), [0x80])
+
+        assert result == [Property(epc=0x80, edt=b"")]
+        client._protocol.send.assert_not_called()
+
+
+class TestInfcHandling:
+    """Tests for INFC (0x74) confirmation handling."""
+
+    @staticmethod
+    def _simulate_receive(client: HemsClient, frame: Frame, address: str) -> None:
+        """Simulate receiving a frame via _on_receive."""
+        frame_data = frame.encode()
+        client._on_receive(frame_data, (address, 3610))
+
+    @pytest.fixture
+    def client_with_protocol(self) -> HemsClient:
+        """Create a client with mocked protocol."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        client._protocol.send = MagicMock()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_infc_response_sent_on_receipt(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """Test that INFC_RES (0x7A) is sent when INFC (0x74) is received."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        # Create an INFC (0x74) frame from a device
+        infc_frame = Frame(
+            tid=42,
+            seoj=EOJ(0x013001),
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.INFC,
+            properties=[
+                Property(epc=0x80, edt=b"\x30"),
+                Property(epc=0xB0, edt=b"\x42"),
+            ],
+        )
+
+        # Simulate receiving the INFC frame
+        self._simulate_receive(client, infc_frame, "192.168.1.10")
+
+        # Give async task time to complete
+        await asyncio.sleep(0.1)
+
+        # Verify that protocol.send was called for the INFC_RES response
+        assert client._protocol is not None
+        send: Any = client._protocol.send
+        assert send.call_count >= 1
+
+        # Get the response frame data from the send call
+        send_calls = list(send.call_args_list)
+        assert len(send_calls) > 0
+
+        # Decode the last sent frame to verify it's INFC_RES
+        last_call_data = send_calls[-1][0][0]  # Get the frame data from the call
+        response_frame = Frame.decode(last_call_data)
+
+        # Verify the response frame is INFC_RES (0x7A)
+        assert response_frame.esv == ESV.INFC_RES
+        # Verify transaction ID is preserved
+        assert response_frame.tid == 42
+        # Verify seoj/deoj are swapped
+        assert response_frame.seoj == CONTROLLER_INSTANCE
+        assert response_frame.deoj == EOJ(0x013001)
+        # Verify properties are included
+        assert len(response_frame.properties) == 2
+
+
+class TestRequestNotifications:
+    """Tests for HemsClient.request_notifications (0x63 -> 0x73/0x53)."""
+
+    @staticmethod
+    def _simulate_receive(client: HemsClient, frame: Frame, address: str) -> None:
+        """Simulate receiving a frame via _on_receive."""
+        frame_data = frame.encode()
+        client._on_receive(frame_data, (address, 3610))
+
+    @pytest.fixture
+    def client_with_protocol(self) -> HemsClient:
+        """Create a client with mocked protocol."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        client._protocol.send = MagicMock()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_all_epcs_confirmed_via_inf(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """A 0x73 response listing all requested EPCs confirms all of them."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        request_task = asyncio.create_task(
+            client.request_notifications(
+                node_id, EOJ(0x013001), [0x80, 0xB0], request_timeout=1.0
+            )
+        )
+        await asyncio.sleep(0.01)
+
+        tid = next(iter(client._pending))
+        response = Frame(
+            tid=tid,
+            seoj=EOJ(0x013001),
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.INF,
+            properties=[Property(epc=0x80), Property(epc=0xB0)],
+        )
+        self._simulate_receive(client, response, "192.168.1.10")
+
+        result = await request_task
+        assert result.notified_epcs == frozenset({0x80, 0xB0})
+        assert result.rejected_epcs == frozenset()
+        assert result.unanswered_epcs == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_partial_epcs_missing_from_inf_are_unanswered(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """EPCs requested but absent from a 0x73 response are unanswered."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        request_task = asyncio.create_task(
+            client.request_notifications(
+                node_id, EOJ(0x013001), [0x80, 0xB0], request_timeout=1.0
+            )
+        )
+        await asyncio.sleep(0.01)
+
+        tid = next(iter(client._pending))
+        response = Frame(
+            tid=tid,
+            seoj=EOJ(0x013001),
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.INF,
+            properties=[Property(epc=0x80)],  # 0xB0 missing
+        )
+        self._simulate_receive(client, response, "192.168.1.10")
+
+        result = await request_task
+        assert result.notified_epcs == frozenset({0x80})
+        assert result.rejected_epcs == frozenset()
+        assert result.unanswered_epcs == frozenset({0xB0})
+
+    @pytest.mark.asyncio
+    async def test_inf_sna_response_marks_epcs_failed(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """A 0x53 (INF_SNA) response marks its listed EPCs as failed."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        request_task = asyncio.create_task(
+            client.request_notifications(
+                node_id, EOJ(0x013001), [0x80, 0xB0], request_timeout=1.0
+            )
+        )
+        await asyncio.sleep(0.01)
+
+        tid = next(iter(client._pending))
+        response = Frame(
+            tid=tid,
+            seoj=EOJ(0x013001),
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.INF_SNA,
+            properties=[Property(epc=0x80), Property(epc=0xB0)],
+        )
+        self._simulate_receive(client, response, "192.168.1.10")
+
+        result = await request_task
+        assert result.notified_epcs == frozenset()
+        assert result.rejected_epcs == frozenset({0x80, 0xB0})
+        assert result.unanswered_epcs == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_timeout_marks_all_epcs_unanswered(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """No response before the timeout marks all EPCs unanswered."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        result = await client.request_notifications(
+            node_id, EOJ(0x013001), [0x80, 0xB0], request_timeout=0.1
+        )
+
+        assert result.notified_epcs == frozenset()
+        assert result.rejected_epcs == frozenset()
+        assert result.unanswered_epcs == frozenset({0x80, 0xB0})
+
+    @pytest.mark.asyncio
+    async def test_response_from_unexpected_address_ignored(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """A same-TID response from a different address does not resolve the pending request."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        request_task = asyncio.create_task(
+            client.request_notifications(
+                node_id, EOJ(0x013001), [0x80], request_timeout=0.1
+            )
+        )
+        await asyncio.sleep(0.01)
+
+        tid = next(iter(client._pending))
+        response = Frame(
+            tid=tid,
+            seoj=EOJ(0x013001),
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.INF,
+            properties=[Property(epc=0x80)],
+        )
+        self._simulate_receive(client, response, "10.0.0.99")
+
+        result = await request_task
+        assert result.unanswered_epcs == frozenset({0x80})
+
+    @pytest.mark.asyncio
+    async def test_no_address_known_returns_unanswered(self) -> None:
+        """Requesting notifications for an unknown node returns unanswered."""
+        client = HemsClient()
+        result = await client.request_notifications(
+            "unknown-node", EOJ(0x013001), [0x80, 0xB0]
+        )
+        assert result.notified_epcs == frozenset()
+        assert result.rejected_epcs == frozenset()
+        assert result.unanswered_epcs == frozenset({0x80, 0xB0})
+
+    @pytest.mark.asyncio
+    async def test_empty_epcs_returns_empty_result(
+        self, client_with_protocol: HemsClient
+    ) -> None:
+        """Requesting notifications with no EPCs is a no-op."""
+        client = client_with_protocol
+        node_id = "fe00000000000000000000000000000001"
+        client._device_addresses.forceput("192.168.1.10", node_id)
+
+        result = await client.request_notifications(node_id, EOJ(0x013001), [])
+        assert result.notified_epcs == frozenset()
+        assert result.rejected_epcs == frozenset()
+        assert result.unanswered_epcs == frozenset()
+
+
+_NODE_ID = "fe00000000000000000000000000000001"
+_ADDRESS = "192.168.1.10"
+
+
+def _client_with_known_node() -> HemsClient:
+    client = HemsClient()
+    client._protocol = MagicMock()
+    client._device_addresses.forceput(_ADDRESS, _NODE_ID)
+    return client
+
+
+def _sent_frames(client: HemsClient) -> list[tuple[Frame, str]]:
+    send = cast(MagicMock, client._protocol).send
+    return [(Frame.decode(c.args[0]), c.args[1]) for c in send.call_args_list]
+
+
+class TestReceiveErrorHandling:
+    """Tests for error classification of received datagrams."""
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param(b"not an echonet lite frame", id="garbage"),
+            pytest.param(
+                bytes.fromhex("1081000101300105ff0172") + b"\x01\x80\x02\x30",
+                id="truncated_edt",
+            ),
+            pytest.param(
+                bytes.fromhex("1081000101300105ff0172") + b"\x01\x80",
+                id="missing_pdc",
+            ),
+            pytest.param(bytes.fromhex("1081000101300105ff01ff00"), id="unknown_esv"),
+        ],
+    )
+    def test_malformed_datagram_is_dropped(self, data: bytes) -> None:
+        """A malformed datagram is counted and dropped without an error event."""
+        client = HemsClient()
+        events: list[RuntimeEvent] = []
+        client.subscribe(events.append)
+
+        client._on_receive(data, (_ADDRESS, 3610))
+
+        assert events == []
+        assert client.decode_error_count == 1
+
+    def test_frame_processing_error_does_not_dispatch_error_event(self) -> None:
+        """An unexpected error while handling a valid frame does not restart."""
+        client = HemsClient()
+        events: list[RuntimeEvent] = []
+        client.subscribe(events.append)
+        frame = Frame(
+            tid=1,
+            seoj=NODE_PROFILE_INSTANCE,
+            deoj=CONTROLLER_INSTANCE,
+            esv=ESV.GET_RES,
+            properties=[Property(epc=EPC.SELF_NODE_INSTANCE_LIST, edt=b"\x00")],
+        )
+
+        with patch.object(
+            client, "_handle_node_profile", side_effect=RuntimeError("bug")
+        ):
+            client._on_receive(frame.encode(), (_ADDRESS, 3610))
+
+        assert events == []
+        assert client.decode_error_count == 0
+
+    def test_protocol_reports_lost_connection(self) -> None:
+        """The protocol reports an unexpected connection loss only."""
+        errors: list[Exception] = []
+        protocol = EchonetLiteProtocol(MagicMock(), error_callback=errors.append)
+        error = OSError("socket closed")
+
+        protocol.connection_lost(None)
+        protocol.connection_lost(error)
+
+        assert errors == [error]
+
+    @pytest.mark.asyncio
+    async def test_lost_connection_dispatches_error_event(self) -> None:
+        """A lost transport connection is dispatched as an error event."""
+        with patch(
+            "pyhems.runtime.create_multicast_socket", new_callable=AsyncMock
+        ) as mock_create:
+            mock_create.return_value = MagicMock()
+            client = HemsClient()
+            events: list[RuntimeEvent] = []
+            client.subscribe(events.append)
+            with patch.object(client, "probe_initial_nodes", return_value=True):
+                await client.start()
+
+            error = OSError("socket closed")
+            mock_create.call_args.kwargs["error_callback"](error)
+            await client.stop()
+
+        assert len(events) == 1
+        assert isinstance(events[0], HemsErrorEvent)
+        assert events[0].error is error
+
+
+class TestStopInterruptsRequests:
+    """Tests for pending requests interrupted by stop()."""
+
+    @pytest.mark.asyncio
+    async def test_setup_get_raises_client_stopped_error(self) -> None:
+        """A setup read interrupted by stop raises ClientStoppedError."""
+        client = _client_with_known_node()
+        request = asyncio.create_task(client.setup_get(_NODE_ID, EOJ(0x013001), [0x80]))
+        await asyncio.sleep(0)
+
+        await client.stop()
+
+        with pytest.raises(ClientStoppedError):
+            await request
+
+    @pytest.mark.asyncio
+    async def test_get_returns_empty_values(self) -> None:
+        """A get interrupted by stop returns empty values instead of raising."""
+        client = _client_with_known_node()
+        request = asyncio.create_task(client.get(_NODE_ID, EOJ(0x013001), [0x80]))
+        await asyncio.sleep(0)
+
+        await client.stop()
+
+        assert await request == [Property(epc=0x80, edt=b"")]
+
+    @pytest.mark.asyncio
+    async def test_request_notifications_returns_unanswered(self) -> None:
+        """An INF_REQ interrupted by stop reports every EPC as unanswered."""
+        client = _client_with_known_node()
+        request = asyncio.create_task(
+            client.request_notifications(_NODE_ID, EOJ(0x013001), [0x80, 0xB0])
+        )
+        await asyncio.sleep(0)
+
+        await client.stop()
+
+        result = await request
+        assert result.notified_epcs == frozenset()
+        assert result.rejected_epcs == frozenset()
+        assert result.unanswered_epcs == frozenset({0x80, 0xB0})
+
+    @pytest.mark.asyncio
+    async def test_set_properties_returns_unanswered(self) -> None:
+        """A SetC interrupted by stop reports every EPC as unanswered."""
+        client = _client_with_known_node()
+        request = asyncio.create_task(
+            client.set_properties(
+                _NODE_ID, EOJ(0x013001), [Property(epc=0x80, edt=b"\x30")]
+            )
+        )
+        await asyncio.sleep(0)
+
+        await client.stop()
+
+        assert await request == SetRequestResult(
+            sent=True,
+            response_esv=None,
+            accepted_epcs=frozenset(),
+            rejected_epcs=frozenset(),
+            unanswered_epcs=frozenset({0x80}),
+        )
+
+
+class TestPendingResponseMatching:
+    """Tests for matching responses to pending requests."""
+
+    @pytest.mark.parametrize(
+        ("address", "seoj"),
+        [
+            pytest.param("10.0.0.99", EOJ(0x013001), id="other_address"),
+            pytest.param(_ADDRESS, EOJ(0x013002), id="other_seoj"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unmatched_get_response_keeps_pending_request(
+        self, address: str, seoj: EOJ
+    ) -> None:
+        """A same-TID GET response from another object does not consume the request."""
+        client = _client_with_known_node()
+        request = asyncio.create_task(
+            client.get(_NODE_ID, EOJ(0x013001), [0x80], request_timeout=1.0)
+        )
+        await asyncio.sleep(0)
+        tid = next(iter(client._pending))
+
+        for source_address, source_eoj, edt in (
+            (address, seoj, b"\x31"),
+            (_ADDRESS, EOJ(0x013001), b"\x30"),
+        ):
+            client._on_receive(
+                Frame(
+                    tid=tid,
+                    seoj=source_eoj,
+                    deoj=CONTROLLER_INSTANCE,
+                    esv=ESV.GET_RES,
+                    properties=[Property(epc=0x80, edt=edt)],
+                ).encode(),
+                (source_address, 3610),
+            )
+
+        assert await request == [Property(epc=0x80, edt=b"\x30")]
+
+    @pytest.mark.parametrize(
+        ("address", "seoj"),
+        [
+            pytest.param("10.0.0.99", EOJ(0x013001), id="other_address"),
+            pytest.param(_ADDRESS, EOJ(0x013002), id="other_seoj"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unmatched_inf_response_keeps_pending_request(
+        self, address: str, seoj: EOJ
+    ) -> None:
+        """A same-TID INF from another object does not consume the INF_REQ."""
+        client = _client_with_known_node()
+        request = asyncio.create_task(
+            client.request_notifications(
+                _NODE_ID, EOJ(0x013001), [0x80], request_timeout=1.0
+            )
+        )
+        await asyncio.sleep(0)
+        tid = next(iter(client._pending))
+
+        for source_address, source_eoj, epc in (
+            (address, seoj, 0xB0),
+            (_ADDRESS, EOJ(0x013001), 0x80),
+        ):
+            client._on_receive(
+                Frame(
+                    tid=tid,
+                    seoj=source_eoj,
+                    deoj=CONTROLLER_INSTANCE,
+                    esv=ESV.INF,
+                    properties=[Property(epc=epc, edt=b"\x30")],
+                ).encode(),
+                (source_address, 3610),
+            )
+
+        result = await request
+        assert result.notified_epcs == frozenset({0x80})
+
+
+class TestUnknownAddressFrames:
+    """Tests for frames received from addresses without a known node."""
+
+    @staticmethod
+    def _device_frame(esv: ESV = ESV.GET_RES) -> Frame:
+        return Frame(
+            tid=1,
+            seoj=EOJ(0x013001),
+            deoj=CONTROLLER_INSTANCE,
+            esv=esv,
+            properties=[Property(epc=0x80, edt=b"\x30")],
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_inf_frame_uses_direct_discovery(self) -> None:
+        """A non-INF frame triggers one unicast discovery instead of multicast."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        address = "192.168.1.120"
+
+        for _ in range(3):
+            client._on_receive(self._device_frame().encode(), (address, 3610))
+        await asyncio.sleep(0)
+
+        sent = _sent_frames(client)
+        assert [destination for _, destination in sent] == [address]
+        assert sent[0][0].deoj == NODE_PROFILE_INSTANCE
+        assert list(client._address_discovery_tasks) == [address]
+        await client.stop()
+
+    @pytest.mark.asyncio
+    async def test_pending_frames_per_address_are_capped(self) -> None:
+        """Frames queued for one unknown address are capped."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        address = "192.168.1.121"
+
+        for _ in range(_MAX_PENDING_FRAMES_PER_ADDRESS + 5):
+            client._on_receive(self._device_frame(ESV.INF).encode(), (address, 3610))
+
+        assert len(client._pending_frames[address]) == _MAX_PENDING_FRAMES_PER_ADDRESS
+        await client.stop()
+
+    @pytest.mark.asyncio
+    async def test_pending_addresses_are_capped(self) -> None:
+        """The number of unknown addresses with queued frames is capped."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+
+        for index in range(_MAX_PENDING_ADDRESSES + 5):
+            client._on_receive(
+                self._device_frame(ESV.INF).encode(), (f"10.1.0.{index}", 3610)
+            )
+
+        assert len(client._pending_frames) == _MAX_PENDING_ADDRESSES
+        await client.stop()
+
+
+class TestInfcResponse:
+    """Tests for the INFC_Res (0x7A) confirmation frame."""
+
+    def test_infc_response_has_no_edt(self) -> None:
+        """INFC_Res echoes the EPCs with PDC=0."""
+        client = _client_with_known_node()
+
+        client._on_receive(
+            Frame(
+                tid=42,
+                seoj=EOJ(0x013001),
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.INFC,
+                properties=[
+                    Property(epc=0x80, edt=b"\x30"),
+                    Property(epc=0xB0, edt=b"\x42"),
+                ],
+            ).encode(),
+            (_ADDRESS, 3610),
+        )
+
+        ((response, destination),) = _sent_frames(client)
+        assert destination == _ADDRESS
+        assert response.esv == ESV.INFC_RES
+        assert response.properties == [Property(epc=0x80), Property(epc=0xB0)]
+
+
+async def _settle() -> None:
+    """Let woken tasks run until they wait again."""
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def _get_response_frame(tid: int, edt: bytes = b"\x30") -> bytes:
+    return Frame(
+        tid=tid,
+        seoj=EOJ(0x013001),
+        deoj=CONTROLLER_INSTANCE,
+        esv=ESV.GET_RES,
+        properties=[Property(epc=0x80, edt=edt)],
+    ).encode()
+
+
+class TestNodeRequestQueue:
+    """Tests for serializing requests per node (ADR-0011)."""
+
+    @pytest.mark.asyncio
+    async def test_one_outstanding_request_per_node(self) -> None:
+        """A second request to the same node waits for the first response."""
+        client = _client_with_known_node()
+        first = asyncio.create_task(
+            client.request_get(_NODE_ID, EOJ(0x013001), [0x80], request_timeout=1.0)
+        )
+        second = asyncio.create_task(
+            client.request_get(_NODE_ID, EOJ(0x013001), [0xB0], request_timeout=1.0)
+        )
+        await asyncio.sleep(0)
+
+        assert len(_sent_frames(client)) == 1
+        (tid,) = client._pending
+        client._on_receive(_get_response_frame(tid), (_ADDRESS, 3610))
+        await _settle()
+
+        sent = _sent_frames(client)
+        assert [frame.properties[0].epc for frame, _ in sent] == [0x80, 0xB0]
+        (tid,) = client._pending
+        client._on_receive(_get_response_frame(tid), (_ADDRESS, 3610))
+        assert await first is not None
+        assert await second is not None
+
+    @pytest.mark.asyncio
+    async def test_set_is_sent_before_queued_polls(self) -> None:
+        """A queued SetC is sent before a poll that was queued earlier."""
+        client = _client_with_known_node()
+        tasks = [
+            asyncio.create_task(
+                client.request_get(_NODE_ID, EOJ(0x013001), [epc], request_timeout=1.0)
+            )
+            for epc in (0x80, 0xB0)
+        ]
+        await asyncio.sleep(0)
+        set_task = asyncio.create_task(
+            client.set_properties(
+                _NODE_ID, EOJ(0x013001), [Property(epc=0x80, edt=b"\x31")]
+            )
+        )
+        await asyncio.sleep(0)
+
+        (tid,) = client._pending
+        client._on_receive(_get_response_frame(tid), (_ADDRESS, 3610))
+        await _settle()
+
+        assert [frame.esv for frame, _ in _sent_frames(client)] == [
+            ESV.GET,
+            ESV.SETC,
+        ]
+        await client.stop()
+        await asyncio.gather(*tasks, set_task)
+
+    @pytest.mark.asyncio
+    async def test_different_nodes_are_requested_in_parallel(self) -> None:
+        """Requests to different nodes do not wait for each other."""
+        client = _client_with_known_node()
+        other_node = "fe00000000000000000000000000000002"
+        client._device_addresses.forceput("192.168.1.11", other_node)
+
+        tasks = [
+            asyncio.create_task(
+                client.request_get(node_id, EOJ(0x013001), [0x80], request_timeout=1.0)
+            )
+            for node_id in (_NODE_ID, other_node)
+        ]
+        await asyncio.sleep(0)
+
+        assert sorted(address for _, address in _sent_frames(client)) == [
+            _ADDRESS,
+            "192.168.1.11",
+        ]
+        await client.stop()
+        assert await asyncio.gather(*tasks) == [None, None]
+
+    @pytest.mark.asyncio
+    async def test_queued_set_reports_unanswered_on_stop(self) -> None:
+        """A SetC still waiting in the queue is unanswered when the client stops."""
+        client = _client_with_known_node()
+        poll = asyncio.create_task(
+            client.request_get(_NODE_ID, EOJ(0x013001), [0x80], request_timeout=1.0)
+        )
+        await asyncio.sleep(0)
+        set_task = asyncio.create_task(
+            client.set_properties(
+                _NODE_ID, EOJ(0x013001), [Property(epc=0x80, edt=b"\x31")]
+            )
+        )
+        await asyncio.sleep(0)
+
+        await client.stop()
+
+        assert await poll is None
+        assert (await set_task).unanswered_epcs == frozenset({0x80})
+        assert client._node_queues == {}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_request_releases_queue(self) -> None:
+        """Cancelling a request that holds the queue lets the next one run."""
+        client = _client_with_known_node()
+        first = asyncio.create_task(
+            client.request_get(_NODE_ID, EOJ(0x013001), [0x80], request_timeout=1.0)
+        )
+        second = asyncio.create_task(
+            client.request_get(_NODE_ID, EOJ(0x013001), [0xB0], request_timeout=1.0)
+        )
+        await asyncio.sleep(0)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await _settle()
+
+        assert [frame.properties[0].epc for frame, _ in _sent_frames(client)] == [
+            0x80,
+            0xB0,
+        ]
+        await client.stop()
+        assert await second is None
+
+    @pytest.mark.asyncio
+    async def test_request_timeout_excludes_queue_wait(self) -> None:
+        """The response timeout starts when the queued request is sent."""
+        client = _client_with_known_node()
+        first = asyncio.create_task(
+            client.request_get(_NODE_ID, EOJ(0x013001), [0x80], request_timeout=0.05)
+        )
+        second = asyncio.create_task(
+            client.request_get(_NODE_ID, EOJ(0x013001), [0xB0], request_timeout=0.05)
+        )
+        assert await first is None
+        await asyncio.sleep(0.01)
+        (tid,) = client._pending
+        client._on_receive(_get_response_frame(tid), (_ADDRESS, 3610))
+
+        assert await second is not None
+
+
+class TestRequestGet:
+    """Tests for single, unsplit GET requests."""
+
+    @pytest.mark.asyncio
+    async def test_returns_response_with_latency(self) -> None:
+        """The response carries the frame properties and the latency."""
+        client = _client_with_known_node()
+        request = asyncio.create_task(
+            client.request_get(_NODE_ID, EOJ(0x013001), [0x80], request_timeout=1.0)
+        )
+        await asyncio.sleep(0)
+        (tid,) = client._pending
+        client._on_receive(_get_response_frame(tid, b"\x31"), (_ADDRESS, 3610))
+
+        response = await request
+
+        assert response is not None
+        assert response.esv == ESV.GET_RES
+        assert response.properties == (Property(epc=0x80, edt=b"\x31"),)
+        assert response.latency >= 0.0
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_none(self) -> None:
+        """An unanswered request returns None."""
+        client = _client_with_known_node()
+
+        assert (
+            await client.request_get(
+                _NODE_ID, EOJ(0x013001), [0x80], request_timeout=0.01
+            )
+            is None
+        )
+        assert client._pending == {}
+
+    @pytest.mark.asyncio
+    async def test_unknown_node_returns_none(self) -> None:
+        """A request to an unknown node is not sent."""
+        client = _client_with_known_node()
+
+        assert await client.request_get("unknown", EOJ(0x013001), [0x80]) is None
+        cast(MagicMock, client._protocol).send.assert_not_called()
+
+
+class TestReadManufacturerCode:
+    """Tests for reading and remembering the manufacturer code."""
+
+    @pytest.mark.asyncio
+    async def test_reads_once_and_remembers(self) -> None:
+        """The code is read on its own once and then reused."""
+        client = _client_with_known_node()
+        request = asyncio.create_task(
+            client.read_manufacturer_code(_NODE_ID, EOJ(0x013001))
+        )
+        await asyncio.sleep(0)
+        ((frame, _),) = _sent_frames(client)
+        assert [prop.epc for prop in frame.properties] == [EPC.MANUFACTURER_CODE]
+        client._on_receive(
+            Frame(
+                tid=frame.tid,
+                seoj=EOJ(0x013001),
+                deoj=CONTROLLER_INSTANCE,
+                esv=ESV.GET_RES,
+                properties=[Property(epc=EPC.MANUFACTURER_CODE, edt=b"\x00\x00\x06")],
+            ).encode(),
+            (_ADDRESS, 3610),
+        )
+
+        assert await request == 0x000006
+        assert await client.read_manufacturer_code(_NODE_ID, EOJ(0x013001)) == 6
+        assert len(_sent_frames(client)) == 1
+
+    @pytest.mark.asyncio
+    async def test_unanswered_read_raises(self) -> None:
+        """An unanswered read gives up the device object."""
+        client = _client_with_known_node()
+
+        with (
+            patch("pyhems.runtime.SETUP_REQUEST_TIMEOUT", 0.01),
+            pytest.raises(GetAbortedError),
+        ):
+            await client.read_manufacturer_code(
+                _NODE_ID, EOJ(0x013001), request_timeout=0.01
+            )
+
+    @pytest.mark.asyncio
+    async def test_unknown_node_raises(self) -> None:
+        """A device without a known address cannot be read."""
+        client = _client_with_known_node()
+
+        with pytest.raises(GetAbortedError):
+            await client.read_manufacturer_code("unknown", EOJ(0x013001))
+
+
+class TestDirectDiscoveryCapability:
+    """Tests that direct discovery does not leave learned state behind."""
+
+    @pytest.mark.asyncio
+    async def test_discovery_does_not_store_capability_by_address(self) -> None:
+        """Discovering an unknown address keeps no capability keyed by address."""
+        client = HemsClient()
+        client._protocol = MagicMock()
+        address = "192.168.1.130"
+
+        with patch("pyhems.runtime.SETUP_REQUEST_TIMEOUT", 0.01):
+            client._on_receive(
+                Frame(
+                    tid=1,
+                    seoj=EOJ(0x013001),
+                    deoj=CONTROLLER_INSTANCE,
+                    esv=ESV.INF,
+                    properties=[Property(epc=0x80, edt=b"\x30")],
+                ).encode(),
+                (address, 3610),
+            )
+            await asyncio.gather(*client._address_discovery_tasks.values())
+
+        assert client._get_capabilities == {}

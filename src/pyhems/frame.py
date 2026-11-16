@@ -1,0 +1,119 @@
+"""ECHONET Lite protocol frame handling."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Self
+
+from .const import ESV
+from .eoj import EOJ
+
+
+class FrameDecodeError(ValueError):
+    """Raised when received data is not a valid ECHONET Lite frame."""
+
+
+@dataclass(slots=True)
+class Property:
+    """ECHONET Lite property in a frame."""
+
+    epc: int
+    edt: bytes = field(default=b"")
+
+    @property
+    def pdc(self) -> int:
+        """Return the property data counter (length of EDT)."""
+        return len(self.edt)
+
+    def __repr__(self) -> str:
+        """Return a string representation of the property."""
+        return f"Property(epc=0x{self.epc:02X}, edt={self.edt.hex()})"
+
+
+@dataclass(slots=True)
+class Frame:
+    """ECHONET Lite frame structure."""
+
+    seoj: EOJ
+    deoj: EOJ
+    esv: ESV
+    tid: int = 0
+    properties: list[Property] = field(default_factory=list)
+
+    # ECHONET Lite header constants
+    EHD1 = 0x10  # ECHONET Lite
+    EHD2 = 0x81  # Format 1
+
+    def is_response_or_notification(self) -> bool:
+        """Check if frame is a response (success or failure) or a notification.
+
+        Success responses: SetGet_Res, Set_Res, Get_Res, INF, INFC,
+        and INFC_Res
+        Failure responses: SetI_SNA, SetC_SNA, Get_SNA, INF_SNA,
+        and SetGet_SNA
+        """
+        return self.esv in {
+            ESV.SETGET_RES,
+            ESV.SET_RES,
+            ESV.GET_RES,
+            ESV.INF,
+            ESV.INFC,
+            ESV.INFC_RES,
+            ESV.SETI_SNA,
+            ESV.SETC_SNA,
+            ESV.GET_SNA,
+            ESV.INF_SNA,
+            ESV.SETGET_SNA,
+        }
+
+    @classmethod
+    def decode(cls, data: bytes) -> Self:
+        """Decode an ECHONET Lite frame from bytes."""
+        if len(data) < 12:
+            raise FrameDecodeError("Frame too short")
+
+        ehd1, ehd2 = data[0], data[1]
+        if ehd1 != cls.EHD1 or ehd2 != cls.EHD2:
+            raise FrameDecodeError(f"Invalid ECHONET Lite header: {ehd1:#x} {ehd2:#x}")
+
+        tid = int.from_bytes(data[2:4], "big")
+        seoj = EOJ.from_bytes(data[4:7])
+        deoj = EOJ.from_bytes(data[7:10])
+        try:
+            esv = ESV(data[10])
+        except ValueError as err:
+            raise FrameDecodeError(f"Unknown ESV: {data[10]:#x}") from err
+        opc = data[11]
+
+        properties: list[Property] = []
+        offset = 12
+        for _ in range(opc):
+            if offset + 2 > len(data):
+                raise FrameDecodeError("Incomplete property header")
+            epc = data[offset]
+            pdc = data[offset + 1]
+            end = offset + 2 + pdc
+            if end > len(data):
+                raise FrameDecodeError("Incomplete property data")
+            properties.append(Property(epc=epc, edt=data[offset + 2 : end]))
+            offset = end
+
+        return cls(seoj=seoj, deoj=deoj, esv=esv, tid=tid, properties=properties)
+
+    def encode(self) -> bytes:
+        """Encode the frame to bytes."""
+        result = bytearray()
+        result.append(self.EHD1)
+        result.append(self.EHD2)
+        result.extend(self.tid.to_bytes(2, "big"))
+        result.extend(self.seoj.to_bytes())
+        result.extend(self.deoj.to_bytes())
+        result.append(self.esv)
+        result.append(len(self.properties))
+
+        for prop in self.properties:
+            result.append(prop.epc)
+            result.append(prop.pdc)
+            result.extend(prop.edt)
+
+        return bytes(result)
